@@ -1,11 +1,10 @@
-# Railway deployment configuration
+[build]
+builder = "nixpacks"
+buildCommand = "npm run build"
 
-# Build Command
-build = "npm run build"
+[deploy]
+startCommand = "npm start"
+restartPolicyType = "ON_FAILURE"
 
-# Start Command  
-start = "npm start"
-
-# Environment
-[environment]
+[variables]
 NODE_ENV = "production"
