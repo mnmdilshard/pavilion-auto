@@ -1,0 +1,11 @@
+# Railway deployment configuration
+
+# Build Command
+build = "npm run build"
+
+# Start Command  
+start = "npm start"
+
+# Environment
+[environment]
+NODE_ENV = "production"

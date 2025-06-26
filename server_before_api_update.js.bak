@@ -1,0 +1,3268 @@
+const express = require('express');
+const app = express();
+const PORT = 3001;
+
+// CORS middleware
+const cors = require('cors');
+const jwt = require('jsonwebtoken');
+const bcrypt = require('bcrypt');
+
+// JWT secret key (in production, use environment variable)
+const JWT_SECRET = 'pavilion_auto_secret_key_2025';
+
+// Enable CORS for all routes
+app.use(cors());
+
+// Middleware for parsing JSON and urlencoded data
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+
+// Log all requests
+app.use((req, res, next) => {
+  console.log(`${req.method} ${req.url}`);
+  next();
+});
+
+// SQLite database setup
+const sqlite3 = require('sqlite3').verbose();
+const fs = require('fs');
+const path = require('path');
+
+// Initialize SQLite database
+const dbFile = path.join(__dirname, 'database.db');
+const schemaFile = path.join(__dirname, 'schema.sql');
+let db;
+
+function connectToDatabase() {
+  return new Promise((resolve, reject) => {
+    db = new sqlite3.Database(dbFile, sqlite3.OPEN_READWRITE, (err) => {
+      if (err) {
+        console.error('Error opening database:', err.message);
+        reject(err);
+      } else {
+        console.log('Connected to SQLite database.');
+        resolve(db);
+      }
+    });
+  });
+}
+
+// Connect to database immediately
+connectToDatabase()
+  .then(() => {
+    console.log('Database connection established successfully');
+    
+    // Initialize users table with default admin user
+    initializeUsersTable();
+    
+    // Test query
+    db.get('SELECT COUNT(*) as count FROM sellers', [], (err, row) => {
+      if (err) {
+        console.error('Error testing database:', err.message);
+      } else {
+        console.log('Number of sellers in database:', row.count);
+      }
+    });
+  })
+  .catch(err => {
+    console.error('Failed to connect to database:', err.message);
+  });
+
+// Initialize users table and create default admin user
+function initializeUsersTable() {
+  const createUsersTable = `
+    CREATE TABLE IF NOT EXISTS users (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      username TEXT UNIQUE NOT NULL,
+      password TEXT NOT NULL,
+      role TEXT NOT NULL DEFAULT 'readonly',
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+  `;
+  
+  db.run(createUsersTable, (err) => {
+    if (err) {
+      console.error('Error creating users table:', err.message);
+      return;
+    }
+    
+    // Check if we need to add role column to existing table
+    db.all("PRAGMA table_info(users)", [], (err, columns) => {
+      if (err) {
+        console.error('Error checking table structure:', err.message);
+        return;
+      }
+      
+      const hasRoleColumn = columns.some(col => col.name === 'role');
+      if (!hasRoleColumn) {
+        db.run('ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT "readonly"', (err) => {
+          if (err) {
+            console.error('Error adding role column:', err.message);
+          } else {
+            console.log('Role column added to users table');
+            // Update existing admin user to have admin role
+            db.run('UPDATE users SET role = "admin" WHERE username = "admin"', (err) => {
+              if (err) {
+                console.error('Error updating admin role:', err.message);
+              }
+            });
+          }
+        });
+      }
+    });
+    
+    // Check if admin user exists
+    db.get('SELECT * FROM users WHERE username = ?', ['admin'], (err, row) => {
+      if (err) {
+        console.error('Error checking for admin user:', err.message);
+        return;
+      }
+      
+      if (!row) {
+        // Create default admin user
+        const hashedPassword = bcrypt.hashSync('admin123', 10);
+        db.run('INSERT INTO users (username, password, role) VALUES (?, ?, ?)', ['admin', hashedPassword, 'admin'], (err) => {
+          if (err) {
+            console.error('Error creating admin user:', err.message);
+          } else {
+            console.log('Default admin user created (username: admin, password: admin123, role: admin)');
+          }
+        });
+      } else if (!row.role) {
+        // Update existing admin user to have admin role
+        db.run('UPDATE users SET role = ? WHERE username = ?', ['admin', 'admin'], (err) => {
+          if (err) {
+            console.error('Error updating admin role:', err.message);
+          } else {
+            console.log('Admin user role updated to admin');
+          }
+        });
+      }
+    });
+    
+    // Check if readonly user exists, if not create one
+    db.get('SELECT * FROM users WHERE username = ?', ['readonly'], (err, row) => {
+      if (err) {
+        console.error('Error checking for readonly user:', err.message);
+        return;
+      }
+      
+      if (!row) {
+        // Create default readonly user
+        const hashedPassword = bcrypt.hashSync('readonly123', 10);
+        db.run('INSERT INTO users (username, password, role) VALUES (?, ?, ?)', ['readonly', hashedPassword, 'readonly'], (err) => {
+          if (err) {
+            console.error('Error creating readonly user:', err.message);
+          } else {
+            console.log('Default readonly user created (username: readonly, password: readonly123, role: readonly)');
+          }
+        });
+      }
+    });
+  });
+}
+
+// Middleware to verify JWT token
+const authenticateToken = (req, res, next) => {
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1];
+
+  if (!token) {
+    return res.status(401).json({ message: 'Access token required' });
+  }
+
+  jwt.verify(token, JWT_SECRET, (err, user) => {
+    if (err) {
+      return res.status(403).json({ message: 'Invalid or expired token' });
+    }
+    req.user = user;
+    next();
+  });
+};
+
+// Middleware to check admin role
+const requireAdmin = (req, res, next) => {
+  if (req.user.role !== 'admin') {
+    return res.status(403).json({ message: 'Admin access required' });
+  }
+  next();
+};
+
+// =========================
+// AUTHENTICATION ROUTES
+// =========================
+
+// Login endpoint
+app.post('/api/auth/login', (req, res) => {
+  const { username, password } = req.body;
+
+  if (!username || !password) {
+    return res.status(400).json({ message: 'Username and password are required' });
+  }
+
+  // Find user in database
+  db.get('SELECT * FROM users WHERE username = ?', [username], (err, user) => {
+    if (err) {
+      console.error('Database error during login:', err.message);
+      return res.status(500).json({ message: 'Server error' });
+    }
+
+    if (!user) {
+      return res.status(401).json({ message: 'Invalid username or password' });
+    }
+
+    // Verify password
+    const isValidPassword = bcrypt.compareSync(password, user.password);
+    if (!isValidPassword) {
+      return res.status(401).json({ message: 'Invalid username or password' });
+    }
+
+    // Generate JWT token
+    const token = jwt.sign(
+      { id: user.id, username: user.username, role: user.role },
+      JWT_SECRET,
+      { expiresIn: '24h' }
+    );
+
+    res.json({
+      message: 'Login successful',
+      token,
+      username: user.username,
+      role: user.role
+    });
+  });
+});
+
+// Verify token endpoint
+app.get('/api/auth/verify', authenticateToken, (req, res) => {
+  res.json({
+    message: 'Token is valid',
+    user: req.user
+  });
+});
+
+// Change password endpoint
+app.post('/api/auth/change-password', authenticateToken, (req, res) => {
+  const { currentPassword, newPassword } = req.body;
+  const userId = req.user.id;
+
+  if (!currentPassword || !newPassword) {
+    return res.status(400).json({ message: 'Current password and new password are required' });
+  }
+
+  if (newPassword.length < 6) {
+    return res.status(400).json({ message: 'New password must be at least 6 characters long' });
+  }
+
+  // Get current user
+  db.get('SELECT * FROM users WHERE id = ?', [userId], (err, user) => {
+    if (err) {
+      console.error('Database error during password change:', err.message);
+      return res.status(500).json({ message: 'Server error' });
+    }
+
+    if (!user) {
+      return res.status(404).json({ message: 'User not found' });
+    }
+
+    // Verify current password
+    const isValidPassword = bcrypt.compareSync(currentPassword, user.password);
+    if (!isValidPassword) {
+      return res.status(401).json({ message: 'Current password is incorrect' });
+    }
+
+    // Hash new password and update
+    const hashedNewPassword = bcrypt.hashSync(newPassword, 10);
+    db.run('UPDATE users SET password = ? WHERE id = ?', [hashedNewPassword, userId], (err) => {
+      if (err) {
+        console.error('Error updating password:', err.message);
+        return res.status(500).json({ message: 'Failed to update password' });
+      }
+      
+      res.json({ message: 'Password updated successfully' });
+    });
+  });
+});
+
+// Basic route
+app.get('/', (req, res) => {
+  res.send('Welcome to Pavilion Auto Backend!');
+});
+
+// Sellers outstanding route
+app.get('/sellers/outstanding', (req, res) => {
+  console.log('GET /sellers/outstanding - started');
+  
+  const query = `
+    WITH Totals AS (
+      SELECT 
+        v.seller_id,
+        SUM(v.lc_amount) as total_lc,
+        SUM(v.bank_transfer_amount) as total_bt
+      FROM vehicles v
+      GROUP BY v.seller_id
+    ),
+    Payments AS (
+      SELECT 
+        s.id as seller_id,
+        SUM(CASE WHEN lr.amount IS NOT NULL THEN lr.amount ELSE 0 END) as paid_lc,
+        SUM(CASE WHEN bt.amount IS NOT NULL THEN bt.amount ELSE 0 END) as paid_bt
+      FROM sellers s
+      LEFT JOIN LCRecords lr ON s.id = lr.seller_id
+      LEFT JOIN BankTransfers bt ON s.id = bt.seller_id
+      GROUP BY s.id
+    )
+    SELECT 
+      s.*,
+      COALESCE(t.total_lc, 0) as total_lc,
+      COALESCE(t.total_bt, 0) as total_bt,
+      COALESCE(p.paid_lc, 0) as paid_lc,
+      COALESCE(p.paid_bt, 0) as paid_bt,
+      COALESCE(t.total_lc, 0) - COALESCE(p.paid_lc, 0) as outstanding_lc,
+      COALESCE(t.total_bt, 0) - COALESCE(p.paid_bt, 0) as outstanding_bank_transfer
+    FROM sellers s
+    LEFT JOIN Totals t ON s.id = t.seller_id
+    LEFT JOIN Payments p ON s.id = p.seller_id
+  `;
+
+  db.all(query, [], function(err, rows) {
+    if (err) {
+      console.error('Database error:', err.message);
+      return res.status(500).json({ error: 'Database error: ' + err.message });
+    }
+    if (!rows || rows.length === 0) {
+      return res.status(404).json({ error: 'No sellers found' });
+    }
+    console.log('Found sellers:', rows.length);
+    return res.json(rows);
+  });
+});
+
+// Vehicles API routes
+
+// Create a new vehicle
+app.post('/vehicles', authenticateToken, requireAdmin, (req, res) => {
+  const {
+    chassis_no,
+    vehicle_type,
+    year,
+    colour,
+    mileage,
+    etd,
+    eta,
+    vessel_name,
+    grade,
+    options,
+    consignee,
+    cif_value_jpy,
+    cif_value_lkr,
+    duty,
+    bank_charges,
+    import_charges,
+    clearing,
+    transport,
+    other,
+    repair,
+    total_cost,
+    sold,
+    profit,
+    seller_id,
+    lc_amount,
+    bank_transfer_amount,
+  } = req.body;
+
+  const query = `INSERT INTO vehicles (
+    chassis_no, vehicle_type, year, colour, mileage, etd, eta, vessel_name, grade, options, consignee,
+    cif_value_jpy, cif_value_lkr, duty, bank_charges, import_charges, clearing, transport, other, repair,
+    total_cost, sold, profit, seller_id, lc_amount, bank_transfer_amount
+  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
+
+  db.run(
+    query,
+    [
+      chassis_no,
+      vehicle_type,
+      year,
+      colour,
+      mileage,
+      etd,
+      eta,
+      vessel_name,
+      grade,
+      options,
+      consignee,
+      cif_value_jpy,
+      cif_value_lkr,
+      duty,
+      bank_charges,
+      import_charges,
+      clearing,
+      transport,
+      other,
+      repair,
+      total_cost,
+      sold,
+      profit,
+      seller_id,
+      lc_amount,
+      bank_transfer_amount
+    ],
+    function (err) {
+      if (err) {
+        console.error('Error creating vehicle record:', err.message);
+        res.status(500).send('Error creating vehicle record');
+      } else {
+        res.status(201).send({ id: this.lastID });
+      }
+    }
+  );
+});
+
+// Get all vehicles
+app.get('/vehicles', (req, res) => {
+  const query = 'SELECT id, chassis_no, vehicle_type, year, colour, mileage, etd, eta, vessel_name, grade, options, consignee, cif_value_jpy, cif_value_lkr, duty, bank_charges, import_charges, clearing, transport, other, repair, total_cost, sold, sale_price, profit, seller_id, lc_amount, bank_transfer_amount, vehicle_status FROM vehicles';
+  db.all(query, [], (err, rows) => {
+    if (err) {
+      console.error('Error fetching vehicle records:', err.message);
+      res.status(500).send('Error fetching vehicle records');
+    } else {
+      res.status(200).send(rows);
+    }
+  });
+});
+
+// Vehicle payment status endpoint
+app.get('/vehicles/payment-status', (req, res) => {
+  const query = `
+    SELECT 
+      v.id as vehicle_id,
+      v.lc_amount,
+      v.bank_transfer_amount,
+      COALESCE(SUM(CASE WHEN lr.amount IS NOT NULL THEN lr.amount ELSE 0 END), 0) as lc_paid,
+      COALESCE(SUM(CASE WHEN bt.amount IS NOT NULL THEN bt.amount ELSE 0 END), 0) as bt_paid,
+      CASE 
+        WHEN COALESCE(SUM(CASE WHEN lr.amount IS NOT NULL THEN lr.amount ELSE 0 END), 0) >= v.lc_amount THEN 1 
+        ELSE 0 
+      END as lc_completed,
+      CASE 
+        WHEN COALESCE(SUM(CASE WHEN bt.amount IS NOT NULL THEN bt.amount ELSE 0 END), 0) >= v.bank_transfer_amount THEN 1 
+        ELSE 0 
+      END as bt_completed
+    FROM vehicles v
+    LEFT JOIN LCRecords lr ON v.id = lr.vehicle_id
+    LEFT JOIN BankTransfers bt ON v.id = bt.vehicle_id
+    GROUP BY v.id, v.lc_amount, v.bank_transfer_amount
+    ORDER BY v.id
+  `;
+  
+  db.all(query, [], (err, rows) => {
+    if (err) {
+      console.error('Error fetching vehicle payment status:', err.message);
+      return res.status(500).json({ error: 'Failed to fetch payment status' });
+    }
+    res.json(rows);
+  });
+});
+
+// Vehicle sales status endpoint
+app.get('/vehicles/sales-status', (req, res) => {
+  const query = `
+    SELECT 
+      vs.vehicle_id,
+      vs.sale_price_lkr,
+      vs.paid_amount_lkr,
+      vs.remaining_amount_lkr,
+      vs.payment_status,
+      vs.sale_date,
+      b.name as buyer_name,
+      b.email as buyer_email,
+      b.phone as buyer_phone
+    FROM vehicle_sales vs
+    JOIN buyers b ON vs.buyer_id = b.id
+    ORDER BY vs.vehicle_id
+  `;
+  
+  db.all(query, [], (err, rows) => {
+    if (err) {
+      console.error('Error fetching vehicle sales status:', err.message);
+      return res.status(500).json({ error: 'Failed to fetch sales status' });
+    }
+    res.json(rows);
+  });
+});
+
+// Get a specific vehicle by ID
+app.get('/vehicles/:id', (req, res) => {
+  const { id } = req.params;
+  const query = 'SELECT id, chassis_no, vehicle_type, year, colour, mileage, etd, eta, vessel_name, grade, options, consignee, cif_value_jpy, cif_value_lkr, duty, bank_charges, import_charges, clearing, transport, other, repair, total_cost, sold, sale_price, profit, seller_id, lc_amount, bank_transfer_amount FROM vehicles WHERE id = ?';
+  db.get(query, [id], (err, row) => {
+    if (err) {
+      res.status(500).json({ error: err.message });
+    } else if (!row) {
+      res.status(404).json({ error: 'Vehicle not found' });
+    } else {
+      res.json(row);
+    }
+  });
+});
+
+// Update a vehicle by ID
+app.put('/vehicles/:id', authenticateToken, requireAdmin, (req, res) => {
+  const { id } = req.params;
+  const {
+    chassis_no,
+    vehicle_type,
+    year,
+    colour,
+    mileage,
+    etd,
+    eta,
+    vessel_name,
+    grade,
+    options,
+    consignee,
+    cif_value_jpy,
+    cif_value_lkr,
+    duty,
+    bank_charges,
+    import_charges,
+    clearing,
+    transport,
+    other,
+    repair,
+    total_cost,
+    sold,
+    sale_price,
+    profit,
+    seller_id,
+    lc_amount,
+    bank_transfer_amount,
+    vehicle_status,
+  } = req.body;
+
+  const query = `UPDATE vehicles SET 
+    chassis_no = ?, vehicle_type = ?, year = ?, colour = ?, mileage = ?, 
+    etd = ?, eta = ?, vessel_name = ?, grade = ?, options = ?, consignee = ?,
+    cif_value_jpy = ?, cif_value_lkr = ?, duty = ?, bank_charges = ?, 
+    import_charges = ?, clearing = ?, transport = ?, other = ?, repair = ?,
+    total_cost = ?, sold = ?, sale_price = ?, profit = ?, seller_id = ?, lc_amount = ?, bank_transfer_amount = ?, vehicle_status = ?
+    WHERE id = ?`;
+
+  db.run(
+    query,
+    [
+      chassis_no,
+      vehicle_type,
+      year,
+      colour,
+      mileage,
+      etd,
+      eta,
+      vessel_name,
+      grade,
+      options,
+      consignee,
+      cif_value_jpy,
+      cif_value_lkr,
+      duty,
+      bank_charges,
+      import_charges,
+      clearing,
+      transport,
+      other,
+      repair,
+      total_cost,
+      sold,
+      sale_price,
+      profit,
+      seller_id,
+      lc_amount,
+      bank_transfer_amount,
+      vehicle_status,
+      id
+    ],
+    function (err) {
+      if (err) {
+        console.error('Error updating vehicle record:', err.message);
+        res.status(500).send('Error updating vehicle record');
+      } else if (this.changes === 0) {
+        res.status(404).send('Vehicle not found');
+      } else {
+        res.status(200).send('Vehicle updated successfully');
+      }
+    }
+  );
+});
+
+// Delete a vehicle by ID
+app.delete('/vehicles/:id', authenticateToken, requireAdmin, (req, res) => {
+  const { id } = req.params;
+  const query = 'DELETE FROM vehicles WHERE id = ?';
+  db.run(query, [id], function (err) {
+    if (err) {
+      res.status(500).json({ error: err.message });
+    } else if (this.changes === 0) {
+      res.status(404).json({ error: 'Vehicle not found' });
+    } else {
+      res.json({ deleted: this.changes });
+    }
+  });
+});
+
+// Sellers API routes
+
+// Add a new seller
+app.post('/sellers', authenticateToken, requireAdmin, (req, res) => {
+  const { name, contact_info } = req.body;
+  const outstanding_balance = 0; // Default value when creating a new seller
+  const query = 'INSERT INTO sellers (name, contact_info, outstanding_balance) VALUES (?, ?, ?)';
+  db.run(query, [name, contact_info, outstanding_balance], function (err) {
+    if (err) {
+      res.status(500).json({ error: err.message });
+    } else {
+      res.status(201).json({ id: this.lastID });
+    }
+  });
+});
+
+// Update the seller list API to include outstanding amount
+app.get('/sellers', (req, res) => {
+  const query = 'SELECT id, name, contact_info, outstanding_balance FROM sellers';
+  
+  db.all(query, [], (err, rows) => {
+    if (err) {
+      res.status(500).json({ error: err.message });
+    } else {
+      res.json(rows);
+    }
+  });
+});
+
+// Get a seller by ID (with vehicles supplied)
+app.get('/sellers/:id', (req, res) => {
+  const { id } = req.params;
+  const sellerQuery = 'SELECT * FROM sellers WHERE id = ?';
+  const vehiclesQuery = `
+    SELECT v.* FROM vehicles v
+    JOIN vehicles_sellers vs ON v.id = vs.vehicle_id
+    WHERE vs.seller_id = ?
+  `;
+
+  db.get(sellerQuery, [id], (err, seller) => {
+    if (err) {
+      res.status(500).json({ error: err.message });
+    } else if (!seller) {
+      res.status(404).json({ error: 'Seller not found' });
+    } else {
+      db.all(vehiclesQuery, [id], (err, vehicles) => {
+        if (err) {
+          res.status(500).json({ error: err.message });
+        } else {
+          res.json({ ...seller, vehicles });
+        }
+      });
+    }
+  });
+});
+
+// Update seller details
+app.put('/sellers/:id', authenticateToken, requireAdmin, (req, res) => {
+  const { id } = req.params;
+  const { name, contact_info } = req.body;
+  const query = 'UPDATE sellers SET name = ?, contact_info = ? WHERE id = ?';
+  db.run(query, [name, contact_info, id], function (err) {
+    if (err) {
+      res.status(500).json({ error: err.message });
+    } else if (this.changes === 0) {
+      res.status(404).json({ error: 'Seller not found' });
+    } else {
+      res.json({ updated: this.changes });
+    }
+  });
+});
+
+// Delete a seller
+app.delete('/sellers/:id', authenticateToken, requireAdmin, (req, res) => {
+  const { id } = req.params;
+  const query = 'DELETE FROM sellers WHERE id = ?';
+  db.run(query, [id], function (err) {
+    if (err) {
+      res.status(500).json({ error: err.message });
+    } else if (this.changes === 0) {
+      res.status(404).json({ error: 'Seller not found' });
+    } else {
+      res.json({ deleted: this.changes });
+    }
+  });
+});
+
+// LC API routes
+
+// Create a new LC record
+app.post('/lc', authenticateToken, requireAdmin, (req, res) => {
+  const { vehicleId, lcAmount, bankTransferAmount } = req.body;
+  const query = `INSERT INTO LC (vehicleId, lcAmount, bankTransferAmount) VALUES (?, ?, ?)`;
+
+  db.run(query, [vehicleId, lcAmount, bankTransferAmount], function (err) {
+    if (err) {
+      console.error('Error creating LC record:', err.message);
+      res.status(500).send('Error creating LC record');
+    } else {
+      res.status(201).send({ id: this.lastID });
+    }
+  });
+});
+
+// Get all LC records
+app.get('/lc', (req, res) => {
+  const query = `SELECT * FROM LC`;
+
+  db.all(query, [], (err, rows) => {
+    if (err) {
+      res.status(500).json({ error: err.message });
+    } else {
+      res.json(rows);
+    }
+  });
+});
+
+// Get an LC record by ID
+app.get('/lc/:id', (req, res) => {
+  const { id } = req.params;
+  const query = `SELECT * FROM LC WHERE id = ?`;
+
+  db.get(query, [id], (err, row) => {
+    if (err) {
+      res.status(500).json({ error: err.message });
+    } else if (!row) {
+      res.status(404).json({ error: 'LC record not found' });
+    } else {
+      res.json(row);
+    }
+  });
+});
+
+// Update an LC record by ID
+app.put('/lc/:id', authenticateToken, requireAdmin, (req, res) => {
+  const { id } = req.params;
+  const { vehicleId, lcAmount, bankTransferAmount } = req.body;
+  const query = `UPDATE LC SET vehicleId = ?, lcAmount = ?, bankTransferAmount = ? WHERE id = ?`;
+
+  db.run(query, [vehicleId, lcAmount, bankTransferAmount, id], function (err) {
+    if (err) {
+      res.status(500).json({ error: err.message });
+    } else if (this.changes === 0) {
+      res.status(404).json({ error: 'LC record not found' });
+    } else {
+      res.json({ updated: this.changes });
+    }
+  });
+});
+
+// Delete an LC record by ID
+app.delete('/lc/:id', authenticateToken, requireAdmin, (req, res) => {
+  const { id } = req.params;
+  const query = `DELETE FROM LC WHERE id = ?`;
+
+  db.run(query, [id], function (err) {
+    if (err) {
+      res.status(500).json({ error: err.message });
+    } else if (this.changes === 0) {
+      res.status(404).json({ error: 'LC record not found' });
+    } else {
+      res.json({ deleted: this.changes });
+    }
+  });
+});
+
+// LC Payment API routes
+
+// Create a new LC payment record
+app.post('/lc-records', authenticateToken, requireAdmin, (req, res) => {
+  const { vehicle_id, seller_id, amount, date, transfer_mode } = req.body;
+  const query = `INSERT INTO LCRecords (vehicle_id, seller_id, amount, date, transfer_mode) VALUES (?, ?, ?, ?, ?)`;
+
+  db.run(query, [vehicle_id, seller_id, amount, date, transfer_mode], function (err) {
+    if (err) {
+      console.error('Error creating LC payment record:', err.message);
+      res.status(500).send('Error creating LC payment record');
+    } else {
+      res.status(201).send({ id: this.lastID });
+    }
+  });
+});
+
+// Get all LC payment records for a vehicle
+app.get('/lc-records/:vehicle_id', (req, res) => {
+  const { vehicle_id } = req.params;
+  const query = `SELECT * FROM LCRecords WHERE vehicle_id = ?`;
+
+  db.all(query, [vehicle_id], (err, rows) => {
+    if (err) {
+      console.error('Error fetching bank transfer records:', err.message);
+      res.status(500).send('Error fetching bank transfer records');
+    } else {
+      res.status(200).send(rows);
+    }
+  });
+});
+
+// Get all LC payment records for a seller
+app.get('/seller-lc-records/:seller_id', (req, res) => {
+  const { seller_id } = req.params;
+  const query = `
+    SELECT lr.*, v.chassis_no, v.vehicle_type, v.year, v.colour, v.mileage, v.etd, v.eta, v.vessel_name, v.grade, v.options, v.consignee
+    FROM LCRecords lr
+    JOIN vehicles v ON lr.vehicle_id = v.id
+    WHERE lr.seller_id = ?
+  `;
+
+  db.all(query, [seller_id], (err, rows) => {
+    if (err) {
+      console.error('Error fetching LC records for seller:', err.message);
+      res.status(500).send('Error fetching LC records for seller');
+    } else {
+      res.status(200).send(rows);
+    }
+  });
+});
+
+// Bank Transfer API routes
+
+// Create a new bank transfer record
+app.post('/bank-transfers', authenticateToken, requireAdmin, (req, res) => {
+  const { vehicle_id, seller_id, amount, date, transfer_mode } = req.body;
+  const query = `INSERT INTO BankTransfers (vehicle_id, seller_id, amount, date, transfer_mode) VALUES (?, ?, ?, ?, ?)`;
+
+  db.run(query, [vehicle_id, seller_id, amount, date, transfer_mode], function (err) {
+    if (err) {
+      console.error('Error creating bank transfer record:', err.message);
+      res.status(500).send('Error creating bank transfer record');
+    } else {
+      res.status(201).send({ id: this.lastID });
+    }
+  });
+});
+
+// Get all bank transfer records for a vehicle
+app.get('/bank-transfers/:vehicle_id', (req, res) => {
+  const { vehicle_id } = req.params;
+  const query = `SELECT * FROM BankTransfers WHERE vehicle_id = ?`;
+
+  db.all(query, [vehicle_id], (err, rows) => {
+    if (err) {
+      console.error('Error fetching bank transfer records:', err.message);
+      res.status(500).send('Error fetching bank transfer records');
+    } else {
+      res.status(200).send(rows);
+    }
+  });
+});
+
+// Calculate remaining bank transfer amount for a vehicle
+app.get('/bank-transfers/remaining/:vehicle_id', (req, res) => {
+  const { vehicle_id } = req.params;
+  const query = `SELECT bank_transfer_amount - COALESCE(SUM(amount), 0) AS remaining FROM vehicles LEFT JOIN BankTransfers ON vehicles.id = BankTransfers.vehicle_id WHERE vehicles.id = ?`;
+
+  db.get(query, [vehicle_id], (err, row) => {
+    if (err) {
+      console.error('Error calculating remaining bank transfer amount:', err.message);
+      res.status(500).send('Error calculating remaining bank transfer amount');
+    } else {
+      res.status(200).send(row);
+    }
+  });
+});
+
+// Calculate remaining LC amount for a vehicle
+app.get('/lc-records/remaining/:vehicle_id', (req, res) => {
+  const { vehicle_id } = req.params;
+  const query = `SELECT lc_amount - COALESCE(SUM(amount), 0) AS remaining FROM vehicles LEFT JOIN LCRecords ON vehicles.id = LCRecords.vehicle_id WHERE vehicles.id = ?`;
+
+  db.get(query, [vehicle_id], (err, row) => {
+    if (err) {
+      console.error('Error calculating remaining LC amount:', err.message);
+      res.status(500).send('Error calculating remaining LC amount');
+    } else {
+      res.status(200).send(row);
+    }
+  });
+});
+
+// Test route with simple response
+app.get('/test', (req, res) => {
+  console.log('GET /test - Test response');
+  res.json([{test: true}]);
+});
+
+// Get vehicles for a seller with payment details
+app.get('/sellers/:id/vehicles', (req, res) => {
+  const sellerId = req.params.id;
+  
+  const query = `
+    SELECT 
+      v.*,
+      (
+        SELECT COALESCE(SUM(amount), 0)
+        FROM LCRecords
+        WHERE vehicle_id = v.id
+      ) as lc_paid_amount,
+      (
+        SELECT COALESCE(SUM(amount), 0)
+        FROM BankTransfers
+        WHERE vehicle_id = v.id
+      ) as bank_transfer_paid_amount
+    FROM vehicles v
+    WHERE v.seller_id = ?
+    ORDER BY v.id DESC
+  `;
+  
+  db.all(query, [sellerId], (err, vehicles) => {
+    if (err) {
+      console.error('Error fetching vehicles:', err);
+      res.status(500).json({ error: 'Internal server error' });
+      return;
+    }
+
+    // Calculate payment status for each vehicle
+    const vehiclesWithStatus = vehicles.map(vehicle => ({
+      ...vehicle,
+      lc_status: vehicle.lc_paid_amount >= vehicle.lc_amount ? 'paid' :
+                 vehicle.lc_paid_amount > 0 ? 'partial' : 'pending',
+      bank_transfer_status: vehicle.bank_transfer_paid_amount >= vehicle.bank_transfer_amount ? 'paid' :
+                           vehicle.bank_transfer_paid_amount > 0 ? 'partial' : 'pending'
+    }));
+
+    res.json(vehiclesWithStatus);
+  });
+});
+
+// Vehicle summary API route
+app.get('/api/vehicle-summary', (req, res) => {
+  const query = `
+    SELECT 
+      COUNT(*) AS total,
+      SUM(CASE WHEN vehicle_status = 'Purchased' THEN 1 ELSE 0 END) AS purchased,
+      SUM(CASE WHEN vehicle_status = 'Shipped' THEN 1 ELSE 0 END) AS shipped,
+      SUM(CASE WHEN vehicle_status = 'Landed' THEN 1 ELSE 0 END) AS landed,
+      SUM(CASE WHEN vehicle_status = 'Delivered' THEN 1 ELSE 0 END) AS delivered,
+      SUM(CASE WHEN vehicle_status = 'Sold' THEN 1 ELSE 0 END) AS sold
+    FROM vehicles;
+  `;
+
+  db.get(query, (err, row) => {
+    if (err) {
+      console.error(err);
+      res.status(500).json({ error: 'Failed to fetch vehicle summary' });
+    } else {
+      res.json(row);
+    }
+  });
+});
+
+// Debug endpoint for seller 8
+app.get('/debug/seller/8', (req, res) => {
+  console.log('Debug endpoint for seller 8');
+  
+  const debugData = {};
+  
+  // Get vehicles data
+  db.all('SELECT id, chassis_no, lc_amount, bank_transfer_amount FROM vehicles WHERE seller_id = 8', [], (err, vehicles) => {
+    if (err) {
+      return res.status(500).json({ error: err.message });
+    }
+    
+    debugData.vehicles = vehicles;
+    
+    // Calculate total LC and BT amounts
+    let totalLc = 0;
+    let totalBt = 0;
+    vehicles.forEach(v => {
+      totalLc += Number(v.lc_amount || 0);
+      totalBt += Number(v.bank_transfer_amount || 0);
+    });
+    
+    debugData.total_lc = totalLc;
+    debugData.total_bt = totalBt;
+    
+    // Get LC payments
+    db.all('SELECT id, vehicle_id, amount FROM LCRecords WHERE seller_id = 8', [], (err, lcPayments) => {
+      if (err) {
+        return res.status(500).json({ error: err.message });
+      }
+      
+      debugData.lc_payments = lcPayments;
+      
+      // Calculate total LC payments
+      let paidLc = 0;
+      lcPayments.forEach(p => {
+        paidLc += Number(p.amount || 0);
+      });
+      
+      debugData.paid_lc = paidLc;
+      debugData.outstanding_lc = totalLc - paidLc;
+      
+      // Get bank transfer payments
+      db.all('SELECT id, vehicle_id, amount FROM BankTransfers WHERE seller_id = 8', [], (err, btPayments) => {
+        if (err) {
+          return res.status(500).json({ error: err.message });
+        }
+        
+        debugData.bt_payments = btPayments;
+        
+        // Calculate total bank transfer payments
+        let paidBt = 0;
+        btPayments.forEach(p => {
+          paidBt += Number(p.amount || 0);
+        });
+        
+        debugData.paid_bt = paidBt;
+        debugData.outstanding_bt = totalBt - paidBt;
+        
+        // Send the complete debug data
+        res.json({
+          seller_id: 8,
+          raw_data: debugData,
+          summary: {
+            total_lc: totalLc,
+            paid_lc: paidLc,
+            outstanding_lc: totalLc - paidLc,
+            total_bt: totalBt,
+            paid_bt: paidBt,
+            outstanding_bt: totalBt - paidBt
+          }
+        });
+      });
+    });
+  });
+});
+
+// Hardcoded sellers data endpoint
+// New reliable implementation for seller outstanding calculation
+app.get('/api/sellers-reliable', (req, res) => {
+  // First get all sellers
+  db.all('SELECT id, name, contact_info, outstanding_balance FROM sellers', [], (err, sellers) => {
+    if (err) {
+      console.error('Error fetching sellers:', err);
+      return res.status(500).json({ error: 'Database error: ' + err.message });
+    }
+    
+    // Process one seller at a time to avoid asynchronous issues
+    const processNextSeller = (index, results) => {
+      // If we've processed all sellers, return the results
+      if (index >= sellers.length) {
+        return res.json(results);
+      }
+      
+      const seller = sellers[index];
+      const sellerId = seller.id;
+      
+      // Use direct SQL aggregation in one query for better reliability
+      const vehicleTotalsQuery = `
+        SELECT 
+          COALESCE(SUM(lc_amount), 0) as total_lc,
+          COALESCE(SUM(bank_transfer_amount), 0) as total_bt
+        FROM vehicles
+        WHERE seller_id = ?
+      `;
+      
+      db.get(vehicleTotalsQuery, [sellerId], (err, vehicleTotals) => {
+        if (err) {
+          console.error(`Error calculating vehicle totals for seller ${sellerId}:`, err);
+          // Continue with next seller even if there's an error
+          processNextSeller(index + 1, [...results, {
+            ...seller,
+            total_lc: 0,
+            total_bt: 0,
+            paid_lc: 0,
+            paid_bt: 0,
+            outstanding_lc: 0,
+            outstanding_bank_transfer: 0
+          }]);
+          return;
+        }
+        
+        // Get LC payment totals
+        const lcPaymentsQuery = `
+          SELECT COALESCE(SUM(amount), 0) as paid_lc
+          FROM LCRecords
+          WHERE seller_id = ?
+        `;
+        
+        db.get(lcPaymentsQuery, [sellerId], (err, lcPayments) => {
+          if (err) {
+            console.error(`Error calculating LC payments for seller ${sellerId}:`, err);
+            lcPayments = { paid_lc: 0 };
+          }
+          
+          // Get Bank Transfer payment totals
+          const btPaymentsQuery = `
+            SELECT COALESCE(SUM(amount), 0) as paid_bt
+            FROM BankTransfers
+            WHERE seller_id = ?
+          `;
+          
+          db.get(btPaymentsQuery, [sellerId], (err, btPayments) => {
+            if (err) {
+              console.error(`Error calculating BT payments for seller ${sellerId}:`, err);
+              btPayments = { paid_bt: 0 };
+            }
+            
+            // Ensure we get proper numbers for calculation
+            const totalLc = Number(vehicleTotals.total_lc || 0);
+            const totalBt = Number(vehicleTotals.total_bt || 0);
+            const paidLc = Number(lcPayments.paid_lc || 0);
+            const paidBt = Number(btPayments.paid_bt || 0);
+            
+            // Calculate outstanding amounts
+            const outstandingLc = Math.round((totalLc - paidLc) * 100) / 100; // Round to 2 decimal places
+            const outstandingBt = Math.round((totalBt - paidBt) * 100) / 100;
+            
+            // Add this seller's data to results
+            const sellerData = {
+              ...seller,
+              total_lc: totalLc,
+              total_bt: totalBt,
+              paid_lc: paidLc,
+              paid_bt: paidBt,
+              outstanding_lc: outstandingLc,
+              outstanding_bank_transfer: outstandingBt
+            };
+            
+            // Log for debugging
+            console.log(`Seller ${sellerId} calculation:`, {
+              totalLc,
+              totalBt,
+              paidLc,
+              paidBt,
+              outstandingLc,
+              outstandingBt
+            });
+            
+            // Process next seller
+            processNextSeller(index + 1, [...results, sellerData]);
+          });
+        });
+      });
+    };
+    
+    // Start processing with the first seller
+    processNextSeller(0, []);
+  });
+});
+
+// ----------------------
+// Investment Tracking API
+// ----------------------
+
+// Initialize the investment tables
+function initializeInvestmentTables() {
+  console.log('Initializing investment tables...');
+  const investmentSchemaFile = path.join(__dirname, 'investment_schema.sql');
+  
+  try {
+    const schemaSQL = fs.readFileSync(investmentSchemaFile, 'utf8');
+    db.exec(schemaSQL, (err) => {
+      if (err) {
+        console.error('Error initializing investment tables:', err.message);
+      } else {
+        console.log('Investment tables initialized successfully');
+      }
+    });
+  } catch (err) {
+    console.error('Error reading investment schema file:', err.message);
+  }
+}
+
+// Initialize profit distribution tables
+function initializeProfitDistributionTables() {
+  console.log('Initializing profit distribution tables...');
+  const profitSchemaFile = path.join(__dirname, 'profit_distribution_schema.sql');
+  
+  try {
+    const schemaSQL = fs.readFileSync(profitSchemaFile, 'utf8');
+    db.exec(schemaSQL, (err) => {
+      if (err) {
+        console.error('Error initializing profit distribution tables:', err.message);
+      } else {
+        console.log('Profit distribution tables initialized successfully');
+      }
+    });
+  } catch (err) {
+    console.error('Error reading profit distribution schema file:', err.message);
+  }
+}
+
+// Call the function to initialize the investment tables
+initializeInvestmentTables();
+
+// Call the function to initialize the profit distribution tables
+initializeProfitDistributionTables();
+
+// --- Investor API Endpoints ---
+
+// Get all investors
+app.get('/api/investors', (req, res) => {
+  const query = 'SELECT * FROM investors ORDER BY name';
+  
+  db.all(query, [], (err, rows) => {
+    if (err) {
+      console.error('Error fetching investors:', err.message);
+      return res.status(500).json({ error: 'Failed to fetch investors' });
+    }
+    
+    res.json(rows);
+  });
+});
+
+// Get a specific investor
+app.get('/api/investors/:id', (req, res) => {
+  const { id } = req.params;
+  const query = 'SELECT * FROM investors WHERE id = ?';
+  
+  db.get(query, [id], (err, row) => {
+    if (err) {
+      console.error('Error fetching investor:', err.message);
+      return res.status(500).json({ error: 'Failed to fetch investor' });
+    }
+    
+    if (!row) {
+      return res.status(404).json({ error: 'Investor not found' });
+    }
+    
+    res.json(row);
+  });
+});
+
+// Create a new investor
+app.post('/api/investors', authenticateToken, requireAdmin, (req, res) => {
+  const { name, contact_info, email, notes } = req.body;
+  
+  if (!name || name.trim() === '') {
+    return res.status(400).json({ error: 'Investor name is required' });
+  }
+  
+  const query = `
+    INSERT INTO investors (name, contact_info, email, notes)
+    VALUES (?, ?, ?, ?)
+  `;
+  
+  db.run(query, [name, contact_info, email, notes], function(err) {
+    if (err) {
+      console.error('Error creating investor:', err.message);
+      return res.status(500).json({ error: 'Failed to create investor' });
+    }
+    
+    res.status(201).json({
+      id: this.lastID,
+      name,
+      contact_info,
+      email,
+      notes
+    });
+  });
+});
+
+// Update an investor
+app.put('/api/investors/:id', authenticateToken, requireAdmin, (req, res) => {
+  const { id } = req.params;
+  const { name, contact_info, email, notes } = req.body;
+  
+  if (!name || name.trim() === '') {
+    return res.status(400).json({ error: 'Investor name is required' });
+  }
+  
+  const query = `
+    UPDATE investors
+    SET name = ?, contact_info = ?, email = ?, notes = ?
+    WHERE id = ?
+  `;
+  
+  db.run(query, [name, contact_info, email, notes, id], function(err) {
+    if (err) {
+      console.error('Error updating investor:', err.message);
+      return res.status(500).json({ error: 'Failed to update investor' });
+    }
+    
+    if (this.changes === 0) {
+      return res.status(404).json({ error: 'Investor not found' });
+    }
+    
+    res.json({
+      id: parseInt(id),
+      name,
+      contact_info,
+      email,
+      notes
+    });
+  });
+});
+
+// Delete an investor
+app.delete('/api/investors/:id', authenticateToken, requireAdmin, (req, res) => {
+  const { id } = req.params;
+  
+  // First check if the investor has any investments
+  db.get('SELECT COUNT(*) as count FROM vehicle_investments WHERE investor_id = ?', [id], (err, result) => {
+    if (err) {
+      console.error('Error checking investor investments:', err.message);
+      return res.status(500).json({ error: 'Failed to check investor investments' });
+    }
+    
+    if (result.count > 0) {
+      // Investor has investments, delete them first
+      db.run('DELETE FROM vehicle_investments WHERE investor_id = ?', [id], (err) => {
+        if (err) {
+          console.error('Error deleting investor investments:', err.message);
+          return res.status(500).json({ error: 'Failed to delete investor investments' });
+        }
+        
+        // Now delete the investor
+        deleteInvestor();
+      });
+    } else {
+      // No investments, directly delete the investor
+      deleteInvestor();
+    }
+  });
+  
+  function deleteInvestor() {
+    db.run('DELETE FROM investors WHERE id = ?', [id], function(err) {
+      if (err) {
+        console.error('Error deleting investor:', err.message);
+        return res.status(500).json({ error: 'Failed to delete investor' });
+      }
+      
+      if (this.changes === 0) {
+        return res.status(404).json({ error: 'Investor not found' });
+      }
+      
+      res.status(200).json({ message: 'Investor deleted successfully' });
+    });
+  }
+});
+
+// --- Vehicle Investment API Endpoints ---
+
+// Get all investments
+app.get('/api/investments', (req, res) => {
+  const query = `
+    SELECT vi.*, i.name as investor_name, v.chassis_no 
+    FROM vehicle_investments vi
+    JOIN investors i ON vi.investor_id = i.id
+    JOIN vehicles v ON vi.vehicle_id = v.id
+    ORDER BY vi.investment_date DESC
+  `;
+  
+  db.all(query, [], (err, rows) => {
+    if (err) {
+      console.error('Error fetching investments:', err.message);
+      return res.status(500).json({ error: 'Failed to fetch investments' });
+    }
+    
+    res.json(rows);
+  });
+});
+
+// Get investments for a specific vehicle
+app.get('/api/investments/vehicle/:vehicleId', (req, res) => {
+  const { vehicleId } = req.params;
+  const query = `
+    SELECT vi.*, i.name as investor_name
+    FROM vehicle_investments vi
+    JOIN investors i ON vi.investor_id = i.id
+    WHERE vi.vehicle_id = ?
+    ORDER BY vi.investment_date DESC
+  `;
+  
+  db.all(query, [vehicleId], (err, rows) => {
+    if (err) {
+      console.error('Error fetching vehicle investments:', err.message);
+      return res.status(500).json({ error: 'Failed to fetch vehicle investments' });
+    }
+    
+    res.json(rows);
+  });
+});
+
+// Get investments for a specific investor
+app.get('/api/investments/investor/:investorId', (req, res) => {
+  const { investorId } = req.params;
+  const query = `
+    SELECT vi.*, v.chassis_no, v.vehicle_type, v.year
+    FROM vehicle_investments vi
+    JOIN vehicles v ON vi.vehicle_id = v.id
+    WHERE vi.investor_id = ?
+    ORDER BY vi.investment_date DESC
+  `;
+  
+  db.all(query, [investorId], (err, rows) => {
+    if (err) {
+      console.error('Error fetching investor investments:', err.message);
+      return res.status(500).json({ error: 'Failed to fetch investor investments' });
+    }
+    
+    res.json(rows);
+  });
+});
+
+// Create a new investment
+app.post('/api/investments', authenticateToken, requireAdmin, (req, res) => {
+  const { vehicle_id, investor_id, amount, investment_date, notes } = req.body;
+  
+  if (!vehicle_id || !investor_id || !amount) {
+    return res.status(400).json({ error: 'Vehicle ID, investor ID, and amount are required' });
+  }
+  
+  const query = `
+    INSERT INTO vehicle_investments (vehicle_id, investor_id, amount, investment_date, notes)
+    VALUES (?, ?, ?, ?, ?)
+  `;
+  
+  db.run(query, [vehicle_id, investor_id, amount, investment_date, notes], function(err) {
+    if (err) {
+      console.error('Error creating investment:', err.message);
+      return res.status(500).json({ error: 'Failed to create investment' });
+    }
+    
+    res.status(201).json({
+      id: this.lastID,
+      vehicle_id,
+      investor_id,
+      amount,
+      investment_date,
+      notes
+    });
+  });
+});
+
+// Update an investment
+app.put('/api/investments/:id', authenticateToken, requireAdmin, (req, res) => {
+  const { id } = req.params;
+  const { amount, investment_date, notes } = req.body;
+  
+  if (!amount) {
+    return res.status(400).json({ error: 'Amount is required' });
+  }
+  
+  const query = `
+    UPDATE vehicle_investments
+    SET amount = ?, investment_date = ?, notes = ?
+    WHERE id = ?
+  `;
+  
+  db.run(query, [amount, investment_date, notes, id], function(err) {
+    if (err) {
+      console.error('Error updating investment:', err.message);
+      return res.status(500).json({ error: 'Failed to update investment' });
+    }
+    
+    if (this.changes === 0) {
+      return res.status(404).json({ error: 'Investment not found' });
+    }
+    
+    res.json({
+      id: parseInt(id),
+      amount,
+      investment_date,
+      notes
+    });
+  });
+});
+
+// Delete an investment
+app.delete('/api/investments/:id', authenticateToken, requireAdmin, (req, res) => {
+  const { id } = req.params;
+  
+  db.run('DELETE FROM vehicle_investments WHERE id = ?', [id], function(err) {
+    if (err) {
+      console.error('Error deleting investment:', err.message);
+      return res.status(500).json({ error: 'Failed to delete investment' });
+    }
+    
+    if (this.changes === 0) {
+      return res.status(404).json({ error: 'Investment not found' });
+    }
+    
+    res.status(200).json({ message: 'Investment deleted successfully' });
+  });
+});
+
+// --- Investment Summary API Endpoints ---
+
+// Get investment summary for a specific investor
+app.get('/api/investments/summary/investor/:investorId', (req, res) => {
+  const { investorId } = req.params;
+  const query = `
+    SELECT 
+      investor_id,
+      SUM(amount) as total_amount,
+      COUNT(DISTINCT vehicle_id) as total_vehicles
+    FROM vehicle_investments
+    WHERE investor_id = ?
+    GROUP BY investor_id
+  `;
+  
+  db.get(query, [investorId], (err, row) => {
+    if (err) {
+      console.error('Error fetching investor investment summary:', err.message);
+      return res.status(500).json({ error: 'Failed to fetch investor investment summary' });
+    }
+    
+    if (!row) {
+      return res.json({
+        investor_id: parseInt(investorId),
+        total_amount: 0,
+        total_vehicles: 0
+      });
+    }
+    
+    res.json(row);
+  });
+});
+
+// Get investment summary for all vehicles and investors
+app.get('/api/investments/summary', (req, res) => {
+  // Get total investment amount
+  db.get('SELECT SUM(amount) as total_investment FROM vehicle_investments', [], (err, totalRow) => {
+    if (err) {
+      console.error('Error fetching total investment:', err.message);
+      return res.status(500).json({ error: 'Failed to fetch investment summary' });
+    }
+    
+    // Get count of vehicles with investments
+    db.get('SELECT COUNT(DISTINCT vehicle_id) as vehicles_with_investments FROM vehicle_investments', [], (err, vehiclesRow) => {
+      if (err) {
+        console.error('Error fetching vehicles count:', err.message);
+        return res.status(500).json({ error: 'Failed to fetch investment summary' });
+      }
+      
+      // Get per-vehicle summary
+      db.all(`
+        SELECT 
+          v.id,
+          v.chassis_no,
+          v.vehicle_type,
+          v.year,
+          SUM(vi.amount) as total_investment,
+          COUNT(DISTINCT vi.investor_id) as investor_count,
+          CASE WHEN COUNT(vi.id) > 0 THEN 1 ELSE 0 END as has_investments
+        FROM vehicles v
+        LEFT JOIN vehicle_investments vi ON v.id = vi.vehicle_id
+        GROUP BY v.id
+      `, [], (err, vehicleDetails) => {
+        if (err) {
+          console.error('Error fetching vehicle details:', err.message);
+          return res.status(500).json({ error: 'Failed to fetch investment summary' });
+        }
+        
+        // Format the response
+        const vehiclesMap = {};
+        vehicleDetails.forEach(vehicle => {
+          vehiclesMap[vehicle.id] = {
+            chassis_no: vehicle.chassis_no,
+            vehicle_type: vehicle.vehicle_type,
+            year: vehicle.year,
+            total_investment: vehicle.total_investment || 0,
+            investor_count: vehicle.investor_count || 0,
+            has_investments: vehicle.has_investments === 1
+          };
+        });
+        
+        res.json({
+          total_investment: totalRow.total_investment || 0,
+          vehicles_with_investments: vehiclesRow.vehicles_with_investments || 0,
+          vehicles: vehiclesMap
+        });
+      });
+    });
+  });
+});
+
+// ----------------------
+// Profit Distribution API
+// ----------------------
+
+// Calculate and distribute profit when a vehicle is sold
+app.post('/api/profit-distribution/calculate/:vehicleId', authenticateToken, requireAdmin, (req, res) => {
+  const vehicleId = req.params.vehicleId;
+  console.log(`Profit distribution calculation requested for vehicle ID: ${vehicleId}`);
+  
+  // First check if there are any investments for this vehicle
+  db.get('SELECT COUNT(*) as count FROM vehicle_investments WHERE vehicle_id = ?', [vehicleId], (err, investmentCount) => {
+    if (err) {
+      console.error('Error checking investments:', err.message);
+      return res.status(500).json({ error: 'Failed to check investments' });
+    }
+    
+    console.log('Investment count:', investmentCount);
+    
+    if (!investmentCount || investmentCount.count === 0) {
+      return res.status(400).json({ error: 'No investments found for this vehicle. Add investments before distributing profit.' });
+    }
+    
+    // Then, get vehicle details to check if it's sold and has profit
+    db.get('SELECT id, profit, sold, vehicle_status FROM vehicles WHERE id = ?', [vehicleId], (err, vehicle) => {
+      console.log('Vehicle data:', vehicle);
+    if (err) {
+      console.error('Error fetching vehicle:', err.message);
+      return res.status(500).json({ error: 'Failed to fetch vehicle details' });
+    }
+    
+    if (!vehicle) {
+      return res.status(404).json({ error: 'Vehicle not found' });
+    }
+    
+    // Check if either the 'sold' field is 'Yes' or the vehicle_status is 'Sold'
+    if (vehicle.sold !== 'Yes' && vehicle.vehicle_status !== 'Sold') {
+      return res.status(400).json({ error: 'Vehicle is not marked as sold' });
+    }
+    
+    if (!vehicle.profit || parseFloat(vehicle.profit) <= 0) {
+      return res.status(400).json({ error: 'Vehicle does not have any profit to distribute' });
+    }
+    
+    const profit = parseFloat(vehicle.profit);
+    
+    // Get all investments for this vehicle to calculate percentages
+    db.all('SELECT * FROM vehicle_investments WHERE vehicle_id = ?', [vehicleId], (err, investments) => {
+      if (err) {
+          console.error('Error fetching investments:', err.message);
+          return res.status(500).json({ error: 'Failed to fetch investments' });
+        }
+        
+        if (investments.length === 0) {
+          return res.status(400).json({ error: 'No investments found for this vehicle' });
+        }
+        
+        // Calculate total investment amount
+        const totalInvestment = investments.reduce((sum, inv) => sum + parseFloat(inv.amount), 0);
+        
+        if (totalInvestment <= 0) {
+          return res.status(400).json({ error: 'Invalid total investment amount' });
+        }
+        
+        // Calculate distribution for each investor
+        const distributions = investments.map(inv => {
+          const percentage = (parseFloat(inv.amount) / totalInvestment) * 100;
+          const amount = (percentage / 100) * profit;
+          
+          return {
+            vehicle_id: vehicleId,
+            investor_id: inv.investor_id,
+            amount: amount,
+            percentage: percentage,
+            distribution_date: new Date().toISOString().split('T')[0],
+            notes: `Profit distribution for vehicle ${vehicleId}`
+          };
+        });
+        
+        // Calculate total profit distributed
+        const totalProfitDistributed = distributions.reduce((sum, dist) => sum + dist.amount, 0);
+        
+        // Begin transaction to insert all distributions
+        db.serialize(() => {
+          db.run('BEGIN TRANSACTION');
+          
+          const stmt = db.prepare(`
+            INSERT INTO profit_distribution 
+            (vehicle_id, investor_id, amount, percentage, distribution_date, notes) 
+            VALUES (?, ?, ?, ?, ?, ?)
+          `);
+          
+          let hasError = false;
+          // Log distribution data for debugging
+          console.log('Distributions to create:', distributions);
+        
+          distributions.forEach(dist => {
+            stmt.run([
+              dist.vehicle_id,
+              dist.investor_id,
+              dist.amount,
+              dist.percentage,
+              dist.distribution_date,
+              dist.notes
+            ], function(err) {
+              if (err) {
+                console.error('Error inserting profit distribution:', err.message);
+                hasError = true;
+              } else {
+                console.log(`Created profit distribution for investor ${dist.investor_id}, amount: ${dist.amount}`);
+              }
+            });
+          });
+          
+          stmt.finalize();
+          
+          if (hasError) {
+            db.run('ROLLBACK');
+            return res.status(500).json({ error: 'Failed to create profit distributions' });
+          }
+          
+          db.run('COMMIT', function(err) {
+            if (err) {
+              console.error('Error committing transaction:', err.message);
+              return res.status(500).json({ error: 'Failed to commit profit distributions' });
+            }
+            
+            res.json({
+              success: true,
+              message: 'Profit distributions created successfully',
+              distributionsCount: distributions.length,
+              totalDistributed: totalProfitDistributed
+            });
+          });
+        });
+      });
+    });
+  });
+});
+
+// Get all profit distributions with vehicle and investor details
+app.get('/api/profit-distributions', (req, res) => {
+  db.all(`
+    SELECT pd.*, v.chassis_no, i.name as investor_name
+    FROM profit_distribution pd
+    JOIN vehicles v ON pd.vehicle_id = v.id
+    JOIN investors i ON pd.investor_id = i.id
+  `, [], (err, distributions) => {
+    if (err) {
+      console.error('Error fetching profit distributions:', err.message);
+      return res.status(500).json({ error: 'Failed to fetch profit distributions' });
+    }
+    
+    res.json(distributions);
+  });
+});
+
+// Get profit distributions for a specific vehicle
+app.get('/api/profit-distribution/vehicle/:vehicleId', (req, res) => {
+  const vehicleId = req.params.vehicleId;
+  
+  db.all(`
+    SELECT pd.*, i.name as investor_name
+    FROM profit_distribution pd
+    JOIN investors i ON pd.investor_id = i.id
+    WHERE pd.vehicle_id = ?
+  `, [vehicleId], (err, distributions) => {
+    if (err) {
+      console.error('Error fetching profit distributions for vehicle:', err.message);
+      return res.status(500).json({ error: 'Failed to fetch profit distributions' });
+    }
+    
+    res.json(distributions);
+  });
+});
+
+// Delete profit distributions for a specific vehicle (to allow recalculation)
+app.delete('/api/profit-distribution/vehicle/:vehicleId', authenticateToken, requireAdmin, (req, res) => {
+  const vehicleId = req.params.vehicleId;
+  
+  db.run('DELETE FROM profit_distribution WHERE vehicle_id = ?', [vehicleId], function(err) {
+    if (err) {
+      console.error('Error deleting profit distributions:', err.message);
+      return res.status(500).json({ error: 'Failed to delete profit distributions' });
+    }
+    
+    console.log(`Deleted ${this.changes} profit distribution records for vehicle ${vehicleId}`);
+    res.json({ 
+      message: 'Profit distributions deleted successfully',
+      deletedCount: this.changes
+    });
+  });
+});
+
+// Get profit distributions for a specific investor
+app.get('/api/profit-distribution/investor/:investorId', (req, res) => {
+  const investorId = req.params.investorId;
+  
+  db.all(`
+    SELECT pd.*, v.chassis_no, v.vehicle_type, v.year
+    FROM profit_distribution pd
+    JOIN vehicles v ON pd.vehicle_id = v.id
+    WHERE pd.investor_id = ?
+  `, [investorId], (err, distributions) => {
+    if (err) {
+      console.error('Error fetching profit distributions for investor:', err.message);
+      return res.status(500).json({ error: 'Failed to fetch profit distributions' });
+    }
+    
+    // Calculate total profit for this investor
+    let totalProfit = 0;
+    distributions.forEach(dist => {
+      totalProfit += parseFloat(dist.amount);
+    });
+    
+    res.json({
+      distributions: distributions,
+      total_profit: totalProfit,
+      total_vehicles: distributions.length
+    });
+  });
+});
+
+// Get profit distribution summary for dashboard
+app.get('/api/profit-distribution/summary', (req, res) => {
+  db.get('SELECT SUM(amount) as total_distributed FROM profit_distribution', [], (err, total) => {
+    if (err) {
+      console.error('Error calculating total profit distribution:', err.message);
+      return res.status(500).json({ error: 'Failed to calculate summary' });
+    }
+    
+    db.get('SELECT COUNT(DISTINCT vehicle_id) as total_vehicles FROM profit_distribution', [], (err, vehicles) => {
+      if (err) {
+        console.error('Error counting vehicles with distribution:', err.message);
+        return res.status(500).json({ error: 'Failed to calculate summary' });
+      }
+      
+      db.get('SELECT COUNT(DISTINCT investor_id) as total_investors FROM profit_distribution', [], (err, investors) => {
+        if (err) {
+          console.error('Error counting investors with distribution:', err.message);
+          return res.status(500).json({ error: 'Failed to calculate summary' });
+        }
+        
+        res.json({
+          total_distributed: total.total_distributed || 0,
+          vehicles_with_profit: vehicles.total_vehicles || 0,
+          total_investors: investors.total_investors || 0
+        });
+      });
+    });
+  });
+});
+
+// Create a property to track vehicles with profit
+app.get('/api/vehicles-with-profit', (req, res) => {
+  db.get('SELECT COUNT(DISTINCT vehicle_id) as count FROM profit_distribution', [], (err, result) => {
+    if (err) {
+      console.error('Error counting vehicles with profit:', err.message);
+      return res.status(500).json({ error: 'Failed to get count' });
+    }
+    
+    res.json({
+      vehicles_with_profit: result.count || 0
+    });
+  });
+});
+
+// =========================
+// REPORTS API ENDPOINTS
+// =========================
+
+// Helper function to build WHERE clause from filters
+function buildWhereClause(filters, tableAlias = '') {
+  const conditions = [];
+  const params = {};
+  
+  if (filters.sellerId) {
+    conditions.push(`${tableAlias}seller_id = $sellerId`);
+    params.$sellerId = filters.sellerId;
+  }
+  
+  if (filters.vehicleId) {
+    conditions.push(`${tableAlias}vehicle_id = $vehicleId`);
+    params.$vehicleId = filters.vehicleId;
+  }
+  
+  if (filters.investorId) {
+    conditions.push(`${tableAlias}investor_id = $investorId`);
+    params.$investorId = filters.investorId;
+  }
+  
+  if (filters.startDate) {
+    conditions.push(`${tableAlias}date >= $startDate`);
+    params.$startDate = filters.startDate;
+  }
+  
+  if (filters.endDate) {
+    conditions.push(`${tableAlias}date <= $endDate`);
+    params.$endDate = filters.endDate;
+  }
+  
+  if (filters.transferMode) {
+    conditions.push(`${tableAlias}transfer_mode = $transferMode`);
+    params.$transferMode = filters.transferMode;
+  }
+  
+  if (filters.vehicleStatus) {
+    conditions.push(`v.vehicle_status = $vehicleStatus`);
+    params.$vehicleStatus = filters.vehicleStatus;
+  }
+  
+  if (filters.minAmount) {
+    conditions.push(`${tableAlias}amount >= $minAmount`);
+    params.$minAmount = parseFloat(filters.minAmount);
+  }
+  
+  if (filters.maxAmount) {
+    conditions.push(`${tableAlias}amount <= $maxAmount`);
+    params.$maxAmount = parseFloat(filters.maxAmount);
+  }
+  
+  return {
+    whereClause: conditions.length > 0 ? 'WHERE ' + conditions.join(' AND ') : '',
+    params
+  };
+}
+
+// Seller Payments Report (Combined Bank Transfers and LC Payments)
+app.get('/api/reports/seller-payments', (req, res) => {
+  const filters = req.query;
+  let whereConditions = [];
+  let params = {};
+  
+  // Build WHERE conditions
+  if (filters.sellerId) {
+    whereConditions.push('seller_id = $sellerId');
+    params.$sellerId = filters.sellerId;
+  }
+  
+  if (filters.vehicleId) {
+    whereConditions.push('vehicle_id = $vehicleId');
+    params.$vehicleId = filters.vehicleId;
+  }
+  
+  if (filters.startDate) {
+    whereConditions.push('date >= $startDate');
+    params.$startDate = filters.startDate;
+  }
+  
+  if (filters.endDate) {
+    whereConditions.push('date <= $endDate');
+    params.$endDate = filters.endDate;
+  }
+  
+  if (filters.transferMode) {
+    whereConditions.push('transfer_mode = $transferMode');
+    params.$transferMode = filters.transferMode;
+  }
+  
+  if (filters.minAmount) {
+    whereConditions.push('amount >= $minAmount');
+    params.$minAmount = parseFloat(filters.minAmount);
+  }
+  
+  if (filters.maxAmount) {
+    whereConditions.push('amount <= $maxAmount');
+    params.$maxAmount = parseFloat(filters.maxAmount);
+  }
+  
+  const whereClause = whereConditions.length > 0 ? 'WHERE ' + whereConditions.join(' AND ') : '';
+  
+  // Build HAVING clause for payment type filter
+  let havingClause = '';
+  if (filters.paymentType) {
+    if (filters.paymentType === 'Bank Transfer') {
+      havingClause = 'HAVING payment_type = "Bank Transfer"';
+    } else if (filters.paymentType === 'LC Payment') {
+      havingClause = 'HAVING payment_type = "LC Payment"';
+    }
+  }
+  
+  const query = `
+    SELECT 
+      id,
+      date,
+      amount,
+      transfer_mode,
+      seller_name,
+      seller_contact,
+      chassis_no,
+      vehicle_type,
+      year,
+      colour,
+      payment_type
+    FROM (
+      SELECT 
+        bt.id,
+        bt.date,
+        bt.amount,
+        bt.transfer_mode,
+        s.name as seller_name,
+        s.contact_info as seller_contact,
+        v.chassis_no,
+        v.vehicle_type,
+        v.year,
+        v.colour,
+        'Bank Transfer' as payment_type
+      FROM BankTransfers bt
+      JOIN sellers s ON bt.seller_id = s.id
+      JOIN vehicles v ON bt.vehicle_id = v.id
+      
+      UNION ALL
+      
+      SELECT 
+        lr.id,
+        lr.date,
+        lr.amount,
+        lr.transfer_mode,
+        s.name as seller_name,
+        s.contact_info as seller_contact,
+        v.chassis_no,
+        v.vehicle_type,
+        v.year,
+        v.colour,
+        'LC Payment' as payment_type
+      FROM LCRecords lr
+      JOIN sellers s ON lr.seller_id = s.id
+      JOIN vehicles v ON lr.vehicle_id = v.id
+    ) combined_payments
+    ${whereClause}
+    ${havingClause}
+    ORDER BY date DESC
+  `;
+  
+  db.all(query, params, (err, rows) => {
+    if (err) {
+      console.error('Error generating seller payments report:', err.message);
+      return res.status(500).json({ error: 'Failed to generate report' });
+    }
+    
+    const totalAmount = rows.reduce((sum, row) => sum + (row.amount || 0), 0);
+    const totalRecords = rows.length;
+    const uniqueSellers = new Set(rows.map(row => row.seller_name)).size;
+    const uniqueVehicles = new Set(rows.map(row => row.chassis_no)).size;
+    const bankTransfers = rows.filter(row => row.payment_type === 'Bank Transfer').length;
+    const lcPayments = rows.filter(row => row.payment_type === 'LC Payment').length;
+    
+    res.json({
+      data: rows,
+      summary: {
+        totalAmount,
+        totalRecords,
+        uniqueSellers,
+        uniqueVehicles,
+        bankTransfers,
+        lcPayments
+      }
+    });
+  });
+});
+
+// LC Payments Report
+app.get('/api/reports/lc-payments', (req, res) => {
+  const filters = req.query;
+  const { whereClause, params } = buildWhereClause(filters, 'lr.');
+  
+  const query = `
+    SELECT 
+      lr.id,
+      lr.date,
+      lr.amount,
+      lr.transfer_mode,
+      s.name as seller_name,
+      s.contact_info as seller_contact,
+      v.chassis_no,
+      v.vehicle_type,
+      v.year,
+      v.colour
+    FROM LCRecords lr
+    JOIN sellers s ON lr.seller_id = s.id
+    JOIN vehicles v ON lr.vehicle_id = v.id
+    ${whereClause}
+    ORDER BY lr.date DESC
+  `;
+  
+  db.all(query, params, (err, rows) => {
+    if (err) {
+      console.error('Error generating LC payments report:', err.message);
+      return res.status(500).json({ error: 'Failed to generate report' });
+    }
+    
+    const totalAmount = rows.reduce((sum, row) => sum + (row.amount || 0), 0);
+    const totalRecords = rows.length;
+    const uniqueSellers = new Set(rows.map(row => row.seller_name)).size;
+    const uniqueVehicles = new Set(rows.map(row => row.chassis_no)).size;
+    
+    res.json({
+      data: rows,
+      summary: {
+        totalAmount,
+        totalRecords,
+        uniqueSellers,
+        uniqueVehicles
+      }
+    });
+  });
+});
+
+// Vehicle Financial Report
+app.get('/api/reports/vehicle-financials', (req, res) => {
+  const filters = req.query;
+  let whereConditions = [];
+  let params = {};
+  
+  if (filters.vehicleId) {
+    whereConditions.push('v.id = $vehicleId');
+    params.$vehicleId = filters.vehicleId;
+  }
+  
+  if (filters.sellerId) {
+    whereConditions.push('v.seller_id = $sellerId');
+    params.$sellerId = filters.sellerId;
+  }
+  
+  if (filters.vehicleStatus) {
+    whereConditions.push('v.vehicle_status = $vehicleStatus');
+    params.$vehicleStatus = filters.vehicleStatus;
+  }
+  
+  if (filters.minAmount && filters.maxAmount) {
+    whereConditions.push('v.total_cost BETWEEN $minAmount AND $maxAmount');
+    params.$minAmount = parseFloat(filters.minAmount);
+    params.$maxAmount = parseFloat(filters.maxAmount);
+  } else if (filters.minAmount) {
+    whereConditions.push('v.total_cost >= $minAmount');
+    params.$minAmount = parseFloat(filters.minAmount);
+  } else if (filters.maxAmount) {
+    whereConditions.push('v.total_cost <= $maxAmount');
+    params.$maxAmount = parseFloat(filters.maxAmount);
+  }
+  
+  const whereClause = whereConditions.length > 0 ? 'WHERE ' + whereConditions.join(' AND ') : '';
+  
+  const query = `
+    SELECT 
+      v.id,
+      v.chassis_no,
+      v.vehicle_type,
+      v.year,
+      v.colour,
+      v.vehicle_status,
+      s.name as seller_name,
+      v.cif_value_jpy,
+      v.cif_value_lkr,
+      v.duty,
+      v.bank_charges,
+      v.import_charges,
+      v.clearing,
+      v.transport,
+      v.other,
+      v.repair,
+      v.total_cost,
+      v.sale_price,
+      v.profit,
+      v.lc_amount,
+      v.bank_transfer_amount,
+      COALESCE(bt_paid.total_paid, 0) as bank_transfer_paid,
+      COALESCE(lc_paid.total_paid, 0) as lc_paid,
+      (v.lc_amount - COALESCE(lc_paid.total_paid, 0)) as lc_outstanding,
+      (v.bank_transfer_amount - COALESCE(bt_paid.total_paid, 0)) as bank_transfer_outstanding
+    FROM vehicles v
+    LEFT JOIN sellers s ON v.seller_id = s.id
+    LEFT JOIN (
+      SELECT vehicle_id, SUM(amount) as total_paid 
+      FROM BankTransfers 
+      GROUP BY vehicle_id
+    ) bt_paid ON v.id = bt_paid.vehicle_id
+    LEFT JOIN (
+      SELECT vehicle_id, SUM(amount) as total_paid 
+      FROM LCRecords 
+      GROUP BY vehicle_id
+    ) lc_paid ON v.id = lc_paid.vehicle_id
+    ${whereClause}
+    ORDER BY v.id DESC
+  `;
+  
+  db.all(query, params, (err, rows) => {
+    if (err) {
+      console.error('Error generating vehicle financial report:', err.message);
+      return res.status(500).json({ error: 'Failed to generate report' });
+    }
+    
+    const totalCost = rows.reduce((sum, row) => sum + (row.total_cost || 0), 0);
+    const totalSalePrice = rows.reduce((sum, row) => sum + (row.sale_price || 0), 0);
+    const totalProfit = rows.reduce((sum, row) => sum + (row.profit || 0), 0);
+    const totalVehicles = rows.length;
+    const soldVehicles = rows.filter(row => row.vehicle_status === 'Sold').length;
+    
+    res.json({
+      data: rows,
+      summary: {
+        totalCost,
+        totalSalePrice,
+        totalProfit,
+        totalVehicles,
+        soldVehicles
+      }
+    });
+  });
+});
+
+// Seller Summary Report
+app.get('/api/reports/seller-summary', (req, res) => {
+  const filters = req.query;
+  let whereConditions = [];
+  let params = {};
+  
+  if (filters.sellerId) {
+    whereConditions.push('s.id = $sellerId');
+    params.$sellerId = filters.sellerId;
+  }
+  
+  const whereClause = whereConditions.length > 0 ? 'WHERE ' + whereConditions.join(' AND ') : '';
+  
+  const query = `
+    SELECT 
+      s.id,
+      s.name,
+      s.contact_info,
+      COUNT(v.id) as total_vehicles,
+      SUM(v.lc_amount) as total_lc_amount,
+      SUM(v.bank_transfer_amount) as total_bank_transfer_amount,
+      COALESCE(bt_summary.total_paid, 0) as bank_transfer_paid,
+      COALESCE(lc_summary.total_paid, 0) as lc_paid,
+      (SUM(v.lc_amount) - COALESCE(lc_summary.total_paid, 0)) as lc_outstanding,
+      (SUM(v.bank_transfer_amount) - COALESCE(bt_summary.total_paid, 0)) as bank_transfer_outstanding,
+      ((SUM(v.lc_amount) - COALESCE(lc_summary.total_paid, 0)) + 
+       (SUM(v.bank_transfer_amount) - COALESCE(bt_summary.total_paid, 0))) as total_outstanding
+    FROM sellers s
+    LEFT JOIN vehicles v ON s.id = v.seller_id
+    LEFT JOIN (
+      SELECT seller_id, SUM(amount) as total_paid 
+      FROM BankTransfers 
+      GROUP BY seller_id
+    ) bt_summary ON s.id = bt_summary.seller_id
+    LEFT JOIN (
+      SELECT seller_id, SUM(amount) as total_paid 
+      FROM LCRecords 
+      GROUP BY seller_id
+    ) lc_summary ON s.id = lc_summary.seller_id
+    ${whereClause}
+    GROUP BY s.id, s.name, s.contact_info
+    ORDER BY total_outstanding DESC
+  `;
+  
+  db.all(query, params, (err, rows) => {
+    if (err) {
+      console.error('Error generating seller summary report:', err.message);
+      return res.status(500).json({ error: 'Failed to generate report' });
+    }
+    
+    const totalOutstanding = rows.reduce((sum, row) => sum + (row.total_outstanding || 0), 0);
+    const totalSellers = rows.length;
+    const sellersWithOutstanding = rows.filter(row => row.total_outstanding > 0).length;
+    
+    res.json({
+      data: rows,
+      summary: {
+        totalOutstanding,
+        totalSellers,
+        sellersWithOutstanding
+      }
+    });
+  });
+});
+
+// Investment Summary Report
+app.get('/api/reports/investment-summary', (req, res) => {
+  const filters = req.query;
+  let whereConditions = [];
+  let params = {};
+  
+  if (filters.investorId) {
+    whereConditions.push('vi.investor_id = $investorId');
+    params.$investorId = filters.investorId;
+  }
+  
+  if (filters.vehicleId) {
+    whereConditions.push('vi.vehicle_id = $vehicleId');
+    params.$vehicleId = filters.vehicleId;
+  }
+  
+  if (filters.startDate) {
+    whereConditions.push('vi.investment_date >= $startDate');
+    params.$startDate = filters.startDate;
+  }
+  
+  if (filters.endDate) {
+    whereConditions.push('vi.investment_date <= $endDate');
+    params.$endDate = filters.endDate;
+  }
+  
+  const whereClause = whereConditions.length > 0 ? 'WHERE ' + whereConditions.join(' AND ') : '';
+  
+  const query = `
+    SELECT 
+      vi.id,
+      vi.investment_date,
+      vi.amount,
+      vi.notes,
+      i.name as investor_name,
+      i.contact_info as investor_contact,
+      v.chassis_no,
+      v.vehicle_type,
+      v.year,
+      v.vehicle_status,
+      COALESCE(pd.profit_received, 0) as profit_received
+    FROM vehicle_investments vi
+    JOIN investors i ON vi.investor_id = i.id
+    JOIN vehicles v ON vi.vehicle_id = v.id
+    LEFT JOIN (
+      SELECT investor_id, vehicle_id, SUM(amount) as profit_received 
+      FROM profit_distribution 
+      GROUP BY investor_id, vehicle_id
+    ) pd ON vi.investor_id = pd.investor_id AND vi.vehicle_id = pd.vehicle_id
+    ${whereClause}
+    ORDER BY vi.investment_date DESC
+  `;
+  
+  db.all(query, params, (err, rows) => {
+    if (err) {
+      console.error('Error generating investment summary report:', err.message);
+      return res.status(500).json({ error: 'Failed to generate report' });
+    }
+    
+    const totalInvestment = rows.reduce((sum, row) => sum + (row.amount || 0), 0);
+    const totalProfitReceived = rows.reduce((sum, row) => sum + (row.profit_received || 0), 0);
+    const totalInvestments = rows.length;
+    const uniqueInvestors = new Set(rows.map(row => row.investor_name)).size;
+    const uniqueVehicles = new Set(rows.map(row => row.chassis_no)).size;
+    
+    res.json({
+      data: rows,
+      summary: {
+        totalInvestment,
+        totalProfitReceived,
+        totalInvestments,
+        uniqueInvestors,
+        uniqueVehicles
+      }
+    });
+  });
+});
+
+// Profit Distribution Report
+app.get('/api/reports/profit-distribution', (req, res) => {
+  const filters = req.query;
+  let whereConditions = [];
+  let params = {};
+  
+  if (filters.investorId) {
+    whereConditions.push('pd.investor_id = $investorId');
+    params.$investorId = filters.investorId;
+  }
+  
+  if (filters.vehicleId) {
+    whereConditions.push('pd.vehicle_id = $vehicleId');
+    params.$vehicleId = filters.vehicleId;
+  }
+  
+  if (filters.startDate) {
+    whereConditions.push('pd.distribution_date >= $startDate');
+    params.$startDate = filters.startDate;
+  }
+  
+  if (filters.endDate) {
+    whereConditions.push('pd.distribution_date <= $endDate');
+    params.$endDate = filters.endDate;
+  }
+  
+  const whereClause = whereConditions.length > 0 ? 'WHERE ' + whereConditions.join(' AND ') : '';
+  
+  const query = `
+    SELECT 
+      pd.id,
+      pd.distribution_date,
+      pd.amount,
+      pd.percentage,
+      pd.notes,
+      i.name as investor_name,
+      i.contact_info as investor_contact,
+      v.chassis_no,
+      v.vehicle_type,
+      v.year,
+      v.sale_price,
+      v.profit
+    FROM profit_distribution pd
+    JOIN investors i ON pd.investor_id = i.id
+    JOIN vehicles v ON pd.vehicle_id = v.id
+    ${whereClause}
+    ORDER BY pd.distribution_date DESC
+  `;
+  
+  db.all(query, params, (err, rows) => {
+    if (err) {
+      console.error('Error generating profit distribution report:', err.message);
+      return res.status(500).json({ error: 'Failed to generate report' });
+    }
+    
+    const totalDistributed = rows.reduce((sum, row) => sum + (row.amount || 0), 0);
+    const totalDistributions = rows.length;
+    const uniqueInvestors = new Set(rows.map(row => row.investor_name)).size;
+    const uniqueVehicles = new Set(rows.map(row => row.chassis_no)).size;
+    
+    res.json({
+      data: rows,
+      summary: {
+        totalDistributed,
+        totalDistributions,
+        uniqueInvestors,
+        uniqueVehicles
+      }
+    });
+  });
+});
+
+// Vehicle Status Report
+app.get('/api/reports/vehicle-status', (req, res) => {
+  const filters = req.query;
+  let whereConditions = [];
+  let params = {};
+  
+  if (filters.vehicleStatus) {
+    whereConditions.push('v.vehicle_status = $vehicleStatus');
+    params.$vehicleStatus = filters.vehicleStatus;
+  }
+  
+  if (filters.sellerId) {
+    whereConditions.push('v.seller_id = $sellerId');
+    params.$sellerId = filters.sellerId;
+  }
+  
+  const whereClause = whereConditions.length > 0 ? 'WHERE ' + whereConditions.join(' AND ') : '';
+  
+  const query = `
+    SELECT 
+      v.vehicle_status,
+      COUNT(*) as vehicle_count,
+      SUM(v.total_cost) as total_cost,
+      SUM(v.sale_price) as total_sale_price,
+      SUM(v.profit) as total_profit,
+      AVG(v.total_cost) as avg_cost,
+      AVG(v.sale_price) as avg_sale_price
+    FROM vehicles v
+    LEFT JOIN sellers s ON v.seller_id = s.id
+    ${whereClause}
+    GROUP BY v.vehicle_status
+    ORDER BY vehicle_count DESC
+  `;
+  
+  db.all(query, params, (err, rows) => {
+    if (err) {
+      console.error('Error generating vehicle status report:', err.message);
+      return res.status(500).json({ error: 'Failed to generate report' });
+    }
+    
+    const totalVehicles = rows.reduce((sum, row) => sum + (row.vehicle_count || 0), 0);
+    const totalCost = rows.reduce((sum, row) => sum + (row.total_cost || 0), 0);
+    const totalSalePrice = rows.reduce((sum, row) => sum + (row.total_sale_price || 0), 0);
+    const totalProfit = rows.reduce((sum, row) => sum + (row.total_profit || 0), 0);
+    
+    res.json({
+      data: rows,
+      summary: {
+        totalVehicles,
+        totalCost,
+        totalSalePrice,
+        totalProfit
+      }
+    });
+  });
+});
+
+// Monthly Summary Report
+app.get('/api/reports/monthly-summary', (req, res) => {
+  const filters = req.query;
+  let dateFilter = '';
+  let params = {};
+  
+  if (filters.startDate && filters.endDate) {
+    dateFilter = 'AND date BETWEEN $startDate AND $endDate';
+    params.$startDate = filters.startDate;
+    params.$endDate = filters.endDate;
+  } else if (filters.startDate) {
+    dateFilter = 'AND date >= $startDate';
+    params.$startDate = filters.startDate;
+  } else if (filters.endDate) {
+    dateFilter = 'AND date <= $endDate';
+    params.$endDate = filters.endDate;
+  }
+  
+  const query = `
+    WITH monthly_data AS (
+      SELECT 
+        strftime('%Y-%m', date) as month,
+        'Bank Transfer' as transaction_type,
+        SUM(amount) as total_amount,
+        COUNT(*) as transaction_count
+      FROM BankTransfers 
+      WHERE 1=1 ${dateFilter}
+      GROUP BY strftime('%Y-%m', date)
+      
+      UNION ALL
+      
+      SELECT 
+        strftime('%Y-%m', date) as month,
+        'LC Payment' as transaction_type,
+        SUM(amount) as total_amount,
+        COUNT(*) as transaction_count
+      FROM LCRecords 
+      WHERE 1=1 ${dateFilter}
+      GROUP BY strftime('%Y-%m', date)
+      
+      UNION ALL
+      
+      SELECT 
+        strftime('%Y-%m', investment_date) as month,
+        'Investment' as transaction_type,
+        SUM(amount) as total_amount,
+        COUNT(*) as transaction_count
+      FROM vehicle_investments 
+      WHERE 1=1 ${dateFilter.replace('date', 'investment_date')}
+      GROUP BY strftime('%Y-%m', investment_date)
+      
+      UNION ALL
+      
+      SELECT 
+        strftime('%Y-%m', distribution_date) as month,
+        'Profit Distribution' as transaction_type,
+        SUM(amount) as total_amount,
+        COUNT(*) as transaction_count
+      FROM profit_distribution 
+      WHERE 1=1 ${dateFilter.replace('date', 'distribution_date')}
+      GROUP BY strftime('%Y-%m', distribution_date)
+    )
+    SELECT 
+      month,
+      transaction_type,
+      total_amount,
+      transaction_count
+    FROM monthly_data
+    ORDER BY month DESC, transaction_type
+  `;
+  
+  db.all(query, params, (err, rows) => {
+    if (err) {
+      console.error('Error generating monthly summary report:', err.message);
+      return res.status(500).json({ error: 'Failed to generate report' });
+    }
+    
+    const monthlyTotals = {};
+    rows.forEach(row => {
+      if (!monthlyTotals[row.month]) {
+        monthlyTotals[row.month] = 0;
+      }
+      monthlyTotals[row.month] += row.total_amount || 0;
+    });
+    
+    const totalAmount = rows.reduce((sum, row) => sum + (row.total_amount || 0), 0);
+    const totalTransactions = rows.reduce((sum, row) => sum + (row.transaction_count || 0), 0);
+    const uniqueMonths = Object.keys(monthlyTotals).length;
+    
+    res.json({
+      data: rows,
+      summary: {
+        totalAmount,
+        totalTransactions,
+        uniqueMonths
+        // Removed monthlyTotals object to prevent React rendering issues
+      }
+    });
+  });
+});
+
+// --- Buyers API Endpoints ---
+
+// Create buyers table if it doesn't exist
+function initializeBuyersTable() {
+  const createBuyersTable = `
+    CREATE TABLE IF NOT EXISTS buyers (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT NOT NULL,
+      contact_info TEXT,
+      email TEXT,
+      address TEXT,
+      total_purchases REAL DEFAULT 0,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+  `;
+  
+  db.run(createBuyersTable, (err) => {
+    if (err) {
+      console.error('Error creating buyers table:', err.message);
+    } else {
+      console.log('Buyers table ready');
+    }
+  });
+}
+
+// Create vehicle_sales table if it doesn't exist
+function initializeVehicleSalesTable() {
+  const createVehicleSalesTable = `
+    CREATE TABLE IF NOT EXISTS vehicle_sales (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      vehicle_id INTEGER NOT NULL,
+      buyer_id INTEGER NOT NULL,
+      sale_price REAL NOT NULL,
+      sale_date DATE NOT NULL,
+      payment_method TEXT,
+      notes TEXT,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (vehicle_id) REFERENCES vehicles (id),
+      FOREIGN KEY (buyer_id) REFERENCES buyers (id)
+    )
+  `;
+  
+  db.run(createVehicleSalesTable, (err) => {
+    if (err) {
+      console.error('Error creating vehicle_sales table:', err.message);
+    } else {
+      console.log('Vehicle sales table ready');
+    }
+  });
+}
+
+// Initialize buyers and vehicle sales tables
+initializeBuyersTable();
+initializeVehicleSalesTable();
+
+// Get all buyers
+app.get('/buyers', (req, res) => {
+  const query = `
+    SELECT 
+      b.*,
+      COUNT(vs.id) as total_sales,
+      COALESCE(SUM(vs.sale_price_lkr), 0) as total_purchases
+    FROM buyers b
+    LEFT JOIN vehicle_sales vs ON b.id = vs.buyer_id
+    GROUP BY b.id
+    ORDER BY b.name
+  `;
+  
+  db.all(query, [], (err, rows) => {
+    if (err) {
+      console.error('Error fetching buyers:', err.message);
+      // Return empty array instead of error for frontend compatibility
+      return res.json([]);
+    }
+    res.json(rows);
+  });
+});
+
+// Get a specific buyer
+app.get('/buyers/:id', (req, res) => {
+  const { id } = req.params;
+  const query = `
+    SELECT 
+      b.*,
+      COUNT(vs.id) as total_sales,
+      COALESCE(SUM(vs.sale_price_lkr), 0) as total_purchases
+    FROM buyers b
+    LEFT JOIN vehicle_sales vs ON b.id = vs.buyer_id
+    WHERE b.id = ?
+    GROUP BY b.id
+  `;
+  
+  db.get(query, [id], (err, row) => {
+    if (err) {
+      console.error('Error fetching buyer:', err.message);
+      return res.status(500).json({ error: 'Failed to fetch buyer' });
+    }
+    if (!row) {
+      return res.status(404).json({ error: 'Buyer not found' });
+    }
+    res.json(row);
+  });
+});
+
+// Create a new buyer
+app.post('/buyers', authenticateToken, requireAdmin, (req, res) => {
+  const { name, email, phone, address, nic } = req.body;
+  
+  if (!name) {
+    return res.status(400).json({ error: 'Name is required' });
+  }
+  
+  const query = 'INSERT INTO buyers (name, email, phone, address, nic) VALUES (?, ?, ?, ?, ?)';
+  
+  db.run(query, [name, email, phone, address, nic], function (err) {
+    if (err) {
+      console.error('Error creating buyer:', err.message);
+      return res.status(500).json({ error: 'Failed to create buyer' });
+    }
+    res.status(201).json({ id: this.lastID, message: 'Buyer created successfully' });
+  });
+});
+
+// Update a buyer
+app.put('/buyers/:id', authenticateToken, requireAdmin, (req, res) => {
+  const { id } = req.params;
+  const { name, email, phone, address, nic } = req.body;
+  
+  if (!name) {
+    return res.status(400).json({ error: 'Name is required' });
+  }
+  
+  const query = 'UPDATE buyers SET name = ?, email = ?, phone = ?, address = ?, nic = ? WHERE id = ?';
+  
+  db.run(query, [name, email, phone, address, nic, id], function (err) {
+    if (err) {
+      console.error('Error updating buyer:', err.message);
+      return res.status(500).json({ error: 'Failed to update buyer' });
+    }
+    if (this.changes === 0) {
+      return res.status(404).json({ error: 'Buyer not found' });
+    }
+    res.json({ message: 'Buyer updated successfully' });
+  });
+});
+
+// Delete a buyer
+app.delete('/buyers/:id', authenticateToken, requireAdmin, (req, res) => {
+  const { id } = req.params;
+  
+  // Check if buyer has any sales
+  db.get('SELECT COUNT(*) as count FROM vehicle_sales WHERE buyer_id = ?', [id], (err, result) => {
+    if (err) {
+      console.error('Error checking buyer sales:', err.message);
+      return res.status(500).json({ error: 'Failed to check buyer sales' });
+    }
+    
+    if (result.count > 0) {
+      return res.status(400).json({ error: 'Cannot delete buyer with existing sales' });
+    }
+    
+    // Delete the buyer
+    const query = 'DELETE FROM buyers WHERE id = ?';
+    db.run(query, [id], function (err) {
+      if (err) {
+        console.error('Error deleting buyer:', err.message);
+        return res.status(500).json({ error: 'Failed to delete buyer' });
+      }
+      if (this.changes === 0) {
+        return res.status(404).json({ error: 'Buyer not found' });
+      }
+      res.json({ message: 'Buyer deleted successfully' });
+    });
+  });
+});
+
+// Vehicle Sales API endpoints
+
+// Get all vehicle sales
+app.get('/vehicle-sales', (req, res) => {
+  const query = `
+    SELECT 
+      vs.*,
+      b.name as buyer_name,
+      COALESCE(b.email, b.phone) as buyer_contact,
+      v.chassis_no,
+      v.vehicle_type,
+      v.year,
+      v.colour
+    FROM vehicle_sales vs
+    JOIN buyers b ON vs.buyer_id = b.id
+    JOIN vehicles v ON vs.vehicle_id = v.id
+    ORDER BY vs.sale_date DESC
+  `;
+  
+  db.all(query, [], (err, rows) => {
+    if (err) {
+      console.error('Error fetching vehicle sales:', err.message);
+      // Return empty array instead of error for frontend compatibility
+      return res.json([]);
+    }
+    res.json(rows);
+  });
+});
+
+// Create a new vehicle sale
+app.post('/vehicle-sales', authenticateToken, requireAdmin, (req, res) => {
+  const { vehicle_id, buyer_id, sale_price_lkr, paid_amount_lkr, sale_date, payment_status, notes } = req.body;
+  
+  if (!vehicle_id || !buyer_id || !sale_price_lkr || !sale_date) {
+    return res.status(400).json({ error: 'Vehicle ID, Buyer ID, sale price, and sale date are required' });
+  }
+  
+  const remaining_amount = sale_price_lkr - (paid_amount_lkr || 0);
+  const finalPaymentStatus = payment_status || (remaining_amount <= 0 ? 'completed' : (paid_amount_lkr > 0 ? 'partial' : 'pending'));
+  
+  // Start a transaction
+  db.serialize(() => {
+    db.run('BEGIN TRANSACTION');
+    
+    // Insert the sale record
+    const insertSaleQuery = `
+      INSERT INTO vehicle_sales (vehicle_id, buyer_id, sale_price_lkr, paid_amount_lkr, remaining_amount_lkr, sale_date, payment_status, notes)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `;
+    
+    db.run(insertSaleQuery, [vehicle_id, buyer_id, sale_price_lkr, paid_amount_lkr || 0, remaining_amount, sale_date, finalPaymentStatus, notes], function (err) {
+      if (err) {
+        console.error('Error creating vehicle sale:', err.message);
+        db.run('ROLLBACK');
+        return res.status(500).json({ error: 'Failed to create vehicle sale' });
+      }
+      
+      const saleId = this.lastID;
+      
+      // Update the vehicle status to 'Sold' and set sale_price
+      const updateVehicleQuery = 'UPDATE vehicles SET vehicle_status = ?, sale_price = ?, sold = ? WHERE id = ?';
+      
+      db.run(updateVehicleQuery, ['Sold', sale_price_lkr, 'Yes', vehicle_id], function (err) {
+        if (err) {
+          console.error('Error updating vehicle status:', err.message);
+          db.run('ROLLBACK');
+          return res.status(500).json({ error: 'Failed to update vehicle status' });
+        }
+        
+        db.run('COMMIT');
+        res.status(201).json({ 
+          id: saleId, 
+          message: 'Vehicle sale created successfully and vehicle marked as sold' 
+        });
+      });
+    });
+  });
+});
+
+// ===== INVOICES API ENDPOINTS =====
+
+// Get all invoices with seller and vehicle details
+app.get('/invoices', authenticateToken, (req, res) => {
+  const query = `
+    SELECT 
+      i.*,
+      s.name as seller_name,
+      s.contact_info as seller_contact,
+      GROUP_CONCAT(v.chassis_no) as vehicle_chassis_numbers,
+      COUNT(iv.vehicle_id) as vehicle_count
+    FROM Invoices i
+    JOIN sellers s ON i.seller_id = s.id
+    LEFT JOIN InvoiceVehicles iv ON i.id = iv.invoice_id
+    LEFT JOIN vehicles v ON iv.vehicle_id = v.id
+    GROUP BY i.id
+    ORDER BY i.created_at DESC
+  `;
+  
+  db.all(query, [], (err, rows) => {
+    if (err) {
+      console.error('Error fetching invoices:', err.message);
+      return res.status(500).json({ error: 'Failed to fetch invoices' });
+    }
+    res.json(rows);
+  });
+});
+
+// Get a specific invoice with full details
+app.get('/invoices/:id', authenticateToken, (req, res) => {
+  const { id } = req.params;
+  
+  const invoiceQuery = `
+    SELECT 
+      i.*,
+      s.name as seller_name,
+      s.contact_info as seller_contact
+    FROM Invoices i
+    JOIN sellers s ON i.seller_id = s.id
+    WHERE i.id = ?
+  `;
+  
+  const vehiclesQuery = `
+    SELECT 
+      v.*,
+      iv.lc_amount as invoice_lc_amount,
+      iv.bt_amount as invoice_bt_amount
+    FROM InvoiceVehicles iv
+    JOIN vehicles v ON iv.vehicle_id = v.id
+    WHERE iv.invoice_id = ?
+  `;
+  
+  const paymentsQuery = `
+    SELECT * FROM InvoicePayments 
+    WHERE invoice_id = ? 
+    ORDER BY date DESC
+  `;
+  
+  db.get(invoiceQuery, [id], (err, invoice) => {
+    if (err) {
+      console.error('Error fetching invoice:', err.message);
+      return res.status(500).json({ error: 'Failed to fetch invoice' });
+    }
+    
+    if (!invoice) {
+      return res.status(404).json({ error: 'Invoice not found' });
+    }
+    
+    db.all(vehiclesQuery, [id], (err, vehicles) => {
+      if (err) {
+        console.error('Error fetching invoice vehicles:', err.message);
+        return res.status(500).json({ error: 'Failed to fetch invoice vehicles' });
+      }
+      
+      db.all(paymentsQuery, [id], (err, payments) => {
+        if (err) {
+          console.error('Error fetching invoice payments:', err.message);
+          return res.status(500).json({ error: 'Failed to fetch invoice payments' });
+        }
+        
+        res.json({
+          ...invoice,
+          vehicles,
+          payments
+        });
+      });
+    });
+  });
+});
+
+// Create a new invoice
+app.post('/invoices', authenticateToken, requireAdmin, (req, res) => {
+  const { seller_id, vehicles } = req.body;
+  
+  if (!seller_id || !vehicles || !Array.isArray(vehicles) || vehicles.length === 0) {
+    return res.status(400).json({ error: 'Seller ID and vehicles array are required' });
+  }
+  
+  // Calculate totals
+  const total_lc_amount = vehicles.reduce((sum, v) => sum + (v.lc_amount || 0), 0);
+  const total_bt_amount = vehicles.reduce((sum, v) => sum + (v.bt_amount || 0), 0);
+  const total_amount = total_lc_amount + total_bt_amount;
+  
+  db.run('BEGIN TRANSACTION');
+  
+  const insertInvoiceQuery = `
+    INSERT INTO Invoices (
+      seller_id, total_amount, total_lc_amount, total_bt_amount,
+      remaining_lc_amount, remaining_bt_amount, status
+    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+  `;
+  
+  db.run(insertInvoiceQuery, [
+    seller_id, total_amount, total_lc_amount, total_bt_amount,
+    total_lc_amount, total_bt_amount, 'pending'
+  ], function (err) {
+    if (err) {
+      console.error('Error creating invoice:', err.message);
+      db.run('ROLLBACK');
+      return res.status(500).json({ error: 'Failed to create invoice' });
+    }
+    
+    const invoiceId = this.lastID;
+    
+    // Add vehicles to invoice
+    const insertVehicleQuery = `
+      INSERT INTO InvoiceVehicles (invoice_id, vehicle_id, lc_amount, bt_amount)
+      VALUES (?, ?, ?, ?)
+    `;
+    
+    let vehiclesProcessed = 0;
+    const totalVehicles = vehicles.length;
+    
+    vehicles.forEach((vehicle) => {
+      db.run(insertVehicleQuery, [
+        invoiceId, vehicle.id, vehicle.lc_amount || 0, vehicle.bt_amount || 0
+      ], (err) => {
+        if (err) {
+          console.error('Error adding vehicle to invoice:', err.message);
+          db.run('ROLLBACK');
+          return res.status(500).json({ error: 'Failed to add vehicle to invoice' });
+        }
+        
+        vehiclesProcessed++;
+        if (vehiclesProcessed === totalVehicles) {
+          db.run('COMMIT');
+          res.status(201).json({ 
+            id: invoiceId, 
+            message: 'Invoice created successfully' 
+          });
+        }
+      });
+    });
+  });
+});
+
+// Add payment to invoice
+app.post('/invoices/:id/payments', authenticateToken, requireAdmin, (req, res) => {
+  const { id } = req.params;
+  const { amount_jpy, amount_lkr, date, transfer_mode, payment_type } = req.body;
+  
+  if (!amount_jpy || !date || !transfer_mode || !payment_type) {
+    return res.status(400).json({ error: 'All payment fields are required' });
+  }
+  
+  if (payment_type !== 'LC' && payment_type !== 'BT') {
+    return res.status(400).json({ error: 'Payment type must be LC or BT' });
+  }
+  
+  db.run('BEGIN TRANSACTION');
+  
+  // Add payment record
+  const insertPaymentQuery = `
+    INSERT INTO InvoicePayments (invoice_id, amount_jpy, amount_lkr, date, transfer_mode, payment_type)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `;
+  
+  db.run(insertPaymentQuery, [id, amount_jpy, amount_lkr || 0, date, transfer_mode, payment_type], function (err) {
+    if (err) {
+      console.error('Error adding payment:', err.message);
+      db.run('ROLLBACK');
+      return res.status(500).json({ error: 'Failed to add payment' });
+    }
+    
+    // Update invoice paid amounts and remaining amounts
+    const updateField = payment_type === 'LC' ? 'paid_lc_amount' : 'paid_bt_amount';
+    const remainingField = payment_type === 'LC' ? 'remaining_lc_amount' : 'remaining_bt_amount';
+    
+    const updateInvoiceQuery = `
+      UPDATE Invoices 
+      SET ${updateField} = ${updateField} + ?,
+          ${remainingField} = ${remainingField} - ?
+      WHERE id = ?
+    `;
+    
+    db.run(updateInvoiceQuery, [amount_jpy, amount_jpy, id], (err) => {
+      if (err) {
+        console.error('Error updating invoice amounts:', err.message);
+        db.run('ROLLBACK');
+        return res.status(500).json({ error: 'Failed to update invoice amounts' });
+      }
+      
+      // Check if invoice is fully paid and update status
+      const checkStatusQuery = `
+        SELECT remaining_lc_amount, remaining_bt_amount FROM Invoices WHERE id = ?
+      `;
+      
+      db.get(checkStatusQuery, [id], (err, invoice) => {
+        if (err) {
+          console.error('Error checking invoice status:', err.message);
+          db.run('ROLLBACK');
+          return res.status(500).json({ error: 'Failed to check invoice status' });
+        }
+        
+        let newStatus = 'pending';
+        if (invoice.remaining_lc_amount <= 0 && invoice.remaining_bt_amount <= 0) {
+          newStatus = 'paid';
+        } else if (invoice.remaining_lc_amount < invoice.total_lc_amount || invoice.remaining_bt_amount < invoice.total_bt_amount) {
+          newStatus = 'partial';
+        }
+        
+        const updateStatusQuery = 'UPDATE Invoices SET status = ? WHERE id = ?';
+        db.run(updateStatusQuery, [newStatus, id], (err) => {
+          if (err) {
+            console.error('Error updating invoice status:', err.message);
+            db.run('ROLLBACK');
+            return res.status(500).json({ error: 'Failed to update invoice status' });
+          }
+          
+          db.run('COMMIT');
+          res.status(201).json({ 
+            message: 'Payment added successfully',
+            status: newStatus
+          });
+        });
+      });
+    });
+  });
+});
+
+// Delete an invoice
+app.delete('/invoices/:id', authenticateToken, requireAdmin, (req, res) => {
+  const { id } = req.params;
+  
+  db.run('DELETE FROM Invoices WHERE id = ?', [id], function (err) {
+    if (err) {
+      console.error('Error deleting invoice:', err.message);
+      return res.status(500).json({ error: 'Failed to delete invoice' });
+    }
+    
+    if (this.changes === 0) {
+      return res.status(404).json({ error: 'Invoice not found' });
+    }
+    
+    res.json({ message: 'Invoice deleted successfully' });
+  });
+});
+
+// ===== USERS API ENDPOINTS =====
+
+// Get all users
+app.get('/api/users', authenticateToken, requireAdmin, (req, res) => {
+  const query = 'SELECT id, username, role, status, created_at, last_login FROM users ORDER BY created_at DESC';
+  
+  db.all(query, [], (err, rows) => {
+    if (err) {
+      console.error('Error fetching users:', err.message);
+      return res.status(500).json({ error: 'Failed to fetch users' });
+    }
+    res.json(rows);
+  });
+});
+
+// Get a specific user
+app.get('/api/users/:id', authenticateToken, requireAdmin, (req, res) => {
+  const { id } = req.params;
+  const query = 'SELECT id, username, role, status, created_at, last_login FROM users WHERE id = ?';
+  
+  db.get(query, [id], (err, row) => {
+    if (err) {
+      console.error('Error fetching user:', err.message);
+      return res.status(500).json({ error: 'Failed to fetch user' });
+    }
+    
+    if (!row) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    
+    res.json(row);
+  });
+});
+
+// Create a new user
+app.post('/api/users', authenticateToken, requireAdmin, (req, res) => {
+  const { username, password, role, status } = req.body;
+  
+  if (!username || !password) {
+    return res.status(400).json({ error: 'Username and password are required' });
+  }
+  
+  const validRoles = ['admin', 'readonly', 'read_only'];
+  const validStatuses = ['active', 'inactive'];
+  
+  if (role && !validRoles.includes(role)) {
+    return res.status(400).json({ error: 'Invalid role' });
+  }
+  
+  if (status && !validStatuses.includes(status)) {
+    return res.status(400).json({ error: 'Invalid status' });
+  }
+  
+  // Hash the password
+  const bcrypt = require('bcrypt');
+  const saltRounds = 10;
+  
+  bcrypt.hash(password, saltRounds, (err, hashedPassword) => {
+    if (err) {
+      console.error('Error hashing password:', err.message);
+      return res.status(500).json({ error: 'Failed to hash password' });
+    }
+    
+    const insertQuery = `
+      INSERT INTO users (username, password, role, status)
+      VALUES (?, ?, ?, ?)
+    `;
+    
+    db.run(insertQuery, [
+      username, 
+      hashedPassword, 
+      role || 'read_only', 
+      status || 'active'
+    ], function (err) {
+      if (err) {
+        console.error('Error creating user:', err.message);
+        if (err.message.includes('UNIQUE constraint failed')) {
+          return res.status(400).json({ error: 'Username already exists' });
+        }
+        return res.status(500).json({ error: 'Failed to create user' });
+      }
+      
+      res.status(201).json({ 
+        id: this.lastID, 
+        username,
+        role: role || 'read_only',
+        status: status || 'active',
+        message: 'User created successfully' 
+      });
+    });
+  });
+});
+
+// Update a user
+app.put('/api/users/:id', authenticateToken, requireAdmin, (req, res) => {
+  const { id } = req.params;
+  const { username, role, status } = req.body;
+  
+  const validRoles = ['admin', 'readonly', 'read_only'];
+  const validStatuses = ['active', 'inactive'];
+  
+  if (role && !validRoles.includes(role)) {
+    return res.status(400).json({ error: 'Invalid role' });
+  }
+  
+  if (status && !validStatuses.includes(status)) {
+    return res.status(400).json({ error: 'Invalid status' });
+  }
+  
+  const updateQuery = `
+    UPDATE users 
+    SET username = COALESCE(?, username),
+        role = COALESCE(?, role),
+        status = COALESCE(?, status)
+    WHERE id = ?
+  `;
+  
+  db.run(updateQuery, [username, role, status, id], function (err) {
+    if (err) {
+      console.error('Error updating user:', err.message);
+      if (err.message.includes('UNIQUE constraint failed')) {
+        return res.status(400).json({ error: 'Username already exists' });
+      }
+      return res.status(500).json({ error: 'Failed to update user' });
+    }
+    
+    if (this.changes === 0) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    
+    res.json({ message: 'User updated successfully' });
+  });
+});
+
+// Reset user password
+app.put('/api/users/:id/password', authenticateToken, requireAdmin, (req, res) => {
+  const { id } = req.params;
+  const { password } = req.body;
+  
+  if (!password) {
+    return res.status(400).json({ error: 'Password is required' });
+  }
+  
+  // Hash the new password
+  const bcrypt = require('bcrypt');
+  const saltRounds = 10;
+  
+  bcrypt.hash(password, saltRounds, (err, hashedPassword) => {
+    if (err) {
+      console.error('Error hashing password:', err.message);
+      return res.status(500).json({ error: 'Failed to hash password' });
+    }
+    
+    const updateQuery = 'UPDATE users SET password = ? WHERE id = ?';
+    
+    db.run(updateQuery, [hashedPassword, id], function (err) {
+      if (err) {
+        console.error('Error updating password:', err.message);
+        return res.status(500).json({ error: 'Failed to update password' });
+      }
+      
+      if (this.changes === 0) {
+        return res.status(404).json({ error: 'User not found' });
+      }
+      
+      res.json({ message: 'Password updated successfully' });
+    });
+  });
+});
+
+// Delete a user
+app.delete('/api/users/:id', authenticateToken, requireAdmin, (req, res) => {
+  const { id } = req.params;
+  
+  db.run('DELETE FROM users WHERE id = ?', [id], function (err) {
+    if (err) {
+      console.error('Error deleting user:', err.message);
+      return res.status(500).json({ error: 'Failed to delete user' });
+    }
+    
+    if (this.changes === 0) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    
+    res.json({ message: 'User deleted successfully' });
+  });
+});
+
+app.listen(PORT, () => {
+  console.log(`Server is running on port ${PORT}`);
+});
