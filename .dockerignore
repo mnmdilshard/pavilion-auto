@@ -1,0 +1,36 @@
+# Dependencies
+node_modules
+client/node_modules
+
+# Environment
+.env
+.env.*
+
+# Build output
+client/build
+
+# Version control
+.git
+.gitignore
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# System Files
+.DS_Store
+Thumbs.db
+
+# Development files
+*.md
+LICENSE
+.vscode/
+.idea/
+
+# Database
+*.db
+
+# Docker
+Dockerfile
+.dockerignore

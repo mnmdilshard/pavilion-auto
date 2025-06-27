@@ -1,13 +1,3 @@
 [build]
-builder = "nixpacks"
-buildCommand = "npm install && cd client && npm install --production=false && npm run build && cd .."
-
-[deploy]
-startCommand = "npm start"
-restartPolicyType = "ON_FAILURE"
-healthcheckPath = "/"
-healthcheckTimeout = 300
-
-[variables]
-NODE_ENV = "production"
-CI = "false"
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
